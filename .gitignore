@@ -2,6 +2,7 @@
 config.json
 .env
 .cookie_secret
+.ui_auth
 *.db
 state.db
 credentials.json

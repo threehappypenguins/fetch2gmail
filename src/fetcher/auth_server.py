@@ -104,7 +104,7 @@ def _auth_callback(
       <li><strong>credentials.json</strong> (from GCP)</li>
       <li><strong>token.json</strong> (just saved at <code>{tok_abs}</code>)</li>
     </ul>
-    <p>Put them in the same folder where Fetch2Gmail runs on the device (e.g. <code>/data</code> in Docker).</p>
+    <p>On the headless server (e.g. Debian, Odroid, Raspberry Pi), put both files in the <strong>data directory</strong> where Fetch2Gmail runs — the same folder as <code>config.json</code>, e.g. <code>/opt/fetch2gmail</code> or <code>/home/odroid/fetch2gmail</code>. See the README for setup.</p>
     <p>You can close this window and stop the server (Ctrl+C).</p>
     </body></html>"""
     return HTMLResponse(html)

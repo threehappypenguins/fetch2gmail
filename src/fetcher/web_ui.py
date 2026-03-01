@@ -1,9 +1,11 @@
 """
-Lightweight FastAPI web UI: localhost only. OAuth only (no username/password).
+Lightweight FastAPI web UI: localhost only by default. OAuth only (no username/password).
 - credentials.json required first; landing page with "Sign in with Google" button.
 - After sign-in, configure ISP email (setup wizard or dashboard).
+- Optional: run `fetch2gmail set-ui-password` to store a hashed UI password in .ui_auth (no plain text); then the UI requires HTTP Basic Auth (e.g. when using --host 0.0.0.0).
 """
 
+import base64
 import json
 import logging
 import os
@@ -26,6 +28,7 @@ from .auth_ui import (
     verify_request,
 )
 from .config import get_config_path, load_config
+from .ui_auth import load_ui_auth, verify_ui_auth
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
 from .log_buffer import get_recent_logs, install_log_buffer
@@ -88,6 +91,39 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Fetch2Gmail", description="IMAP to Gmail import service", lifespan=_lifespan)
 
+
+def _config_dir_for_middleware() -> Path | None:
+    """Config directory for UI auth file; None if not determinable (e.g. no config path yet)."""
+    try:
+        return get_config_path().resolve().parent
+    except Exception:
+        return None
+
+
+@app.middleware("http")
+async def _optional_basic_auth(request: Request, call_next):
+    """If .ui_auth exists in config dir (hashed password), require HTTP Basic Auth for all requests."""
+    config_dir = _config_dir_for_middleware()
+    ui_creds = load_ui_auth(config_dir) if config_dir else None
+    if not ui_creds:
+        return await call_next(request)
+    auth = request.headers.get("Authorization")
+    if auth and auth.startswith("Basic "):
+        try:
+            raw = base64.b64decode(auth[6:].strip()).decode("utf-8")
+            user, _, password = raw.partition(":")
+            if verify_ui_auth(config_dir, user, password):
+                return await call_next(request)
+        except Exception:
+            pass
+    from starlette.responses import Response
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": "Basic realm=\"Fetch2Gmail\""},
+        content="Authentication required",
+    )
+
+
 # In-memory state for OAuth (state param -> valid). Single process only.
 _oauth_states: dict[str, bool] = {}
 
@@ -113,8 +149,11 @@ def _config_exists() -> bool:
 
 
 def _require_auth(request: Request) -> bool:
-    """True if request is authenticated (session cookie or no auth required)."""
-    return verify_request(request, _config_dir_safe(), _config_exists())
+    """True if request is authenticated: UI password (Basic Auth already passed), or Google session, or no auth required."""
+    cfg_dir = _config_dir_safe()
+    if load_ui_auth(cfg_dir):
+        return True  # UI password mode: they passed Basic Auth in the middleware
+    return verify_request(request, cfg_dir, _config_exists())
 
 
 # Sanitized config for UI (no passwords, no token paths)
@@ -165,8 +204,10 @@ def api_setup_status() -> dict[str, bool]:
 
 @app.get("/login", response_class=HTMLResponse, response_model=None)
 def login_page(request: Request) -> RedirectResponse:
-    """OAuth only: redirect to Google sign-in."""
+    """Redirect to Google sign-in only when UI password not used."""
     cfg_dir = _config_dir_safe()
+    if load_ui_auth(cfg_dir):
+        return RedirectResponse(url="/", status_code=302)  # UI password mode: no Google needed
     exists = _config_exists()
     if not auth_required(cfg_dir, exists):
         return RedirectResponse(url="/", status_code=302)
@@ -177,16 +218,20 @@ def login_page(request: Request) -> RedirectResponse:
 
 @app.get("/api/auth/required")
 def api_auth_required() -> dict[str, Any]:
-    """Whether UI login is required (credentials exist)."""
+    """Whether UI must show Google sign-in. False when .ui_auth is used (Basic Auth is the gate)."""
     cfg_dir = _config_dir_safe()
-    exists = _config_exists()
-    return {"auth_required": auth_required(cfg_dir, exists)}
+    if load_ui_auth(cfg_dir):
+        return {"auth_required": False}
+    return {"auth_required": auth_required(cfg_dir, _config_exists())}
 
 
 @app.get("/api/auth/session")
 def api_auth_session(request: Request) -> dict[str, bool]:
-    """Whether the current request has a valid session (no auth required to call)."""
-    return {"logged_in": verify_request(request, _config_dir_safe(), _config_exists())}
+    """Whether the current request is logged in (UI password passed, or Google session, or no auth)."""
+    cfg_dir = _config_dir_safe()
+    if load_ui_auth(cfg_dir):
+        return {"logged_in": True}
+    return {"logged_in": verify_request(request, cfg_dir, _config_exists())}
 
 
 @app.post("/api/logout")

@@ -63,6 +63,12 @@ def main() -> None:
     p_auth.add_argument("--port", type=int, default=8765, help="Port for local OAuth callback (default: 8765)")
     p_auth.set_defaults(func=_cmd_auth)
 
+    p_set_ui_password = sub.add_parser(
+        "set-ui-password",
+        help="Set a username and password for the web UI (stored as a hash in .ui_auth; use when exposing UI with --host 0.0.0.0)",
+    )
+    p_set_ui_password.set_defaults(func=_cmd_set_ui_password)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -128,6 +134,27 @@ def _cmd_config(args: argparse.Namespace) -> None:
 def _cmd_serve(args: argparse.Namespace) -> None:
     from .web_ui import serve
     serve(host=args.host, port=args.port, config_path=args.config)
+
+
+def _cmd_set_ui_password(args: argparse.Namespace) -> None:
+    """Prompt for username and password; store bcrypt hash in .ui_auth in config directory."""
+    import getpass
+
+    from .ui_auth import create_ui_auth
+
+    config_path = Path(args.config or get_config_path()).resolve()
+    config_dir = config_path.parent
+    print(f"Storing UI auth in {config_dir / '.ui_auth'} (password is hashed, not stored in plain text).")
+    username = input("Username: ").strip()
+    if not username:
+        print("Username cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+    password = getpass.getpass("Password: ")
+    if not password:
+        print("Password cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+    create_ui_auth(config_dir, username, password)
+    print("Done. The web UI will now require this username and password when you run it (e.g. with --host 0.0.0.0).")
 
 
 def _cmd_auth(args: argparse.Namespace) -> None:

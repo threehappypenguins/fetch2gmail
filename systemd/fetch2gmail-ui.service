@@ -1,0 +1,23 @@
+[Unit]
+Description=Fetch2Gmail - web UI (always on)
+Documentation=https://github.com/yourusername/fetch2gmail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Environment=FETCH2GMAIL_CONFIG=/home/YOUR_USER/fetch2gmail/config.json
+WorkingDirectory=/home/YOUR_USER/fetch2gmail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fetch2gmail-ui
+# pipx: ExecStart=/home/YOUR_USER/.local/bin/fetch2gmail serve --host 0.0.0.0
+# Venv: ExecStart=/home/YOUR_USER/fetch2gmail/.venv/bin/fetch2gmail serve --host 0.0.0.0
+ExecStart=/home/YOUR_USER/.local/bin/fetch2gmail serve --host 0.0.0.0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
