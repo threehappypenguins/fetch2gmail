@@ -186,6 +186,7 @@ class ConfigResponse(BaseModel):
     state_db_path: str
     gmail_connected: bool
     imap_password_set: bool
+    config_exists: bool = True  # False when config.json not created yet (show setup wizard)
 
 
 @app.get("/static/app.js", response_model=None)
@@ -236,7 +237,12 @@ def api_auth_session(request: Request) -> dict[str, bool]:
 
 @app.post("/api/logout")
 def api_logout():
-    resp = RedirectResponse(url="/login", status_code=302)
+    """Clear session and redirect. With Basic Auth, browser may still re-send credentials; redirect to / with hint."""
+    cfg_dir = _config_dir_safe()
+    if load_ui_auth(cfg_dir):
+        resp = RedirectResponse(url="/?logged_out=1", status_code=302)
+    else:
+        resp = RedirectResponse(url="/login", status_code=302)
     clear_session_cookie(resp)
     return resp
 
@@ -305,15 +311,42 @@ def api_gmail_email(request: Request) -> dict[str, str | None]:
     return {"email": _gmail_email()}
 
 
+def _default_config_response() -> ConfigResponse:
+    """Return empty config when config.json does not exist yet (avoids 404, show setup wizard)."""
+    return ConfigResponse(
+        imap=ImapConfigSafe(
+            host="",
+            port=993,
+            username="",
+            mailbox="INBOX",
+            use_ssl=True,
+            delete_after_import=True,
+        ),
+        gmail=GmailConfigSafe(
+            use_label=False,
+            label="ISP Mail",
+            credentials_path="credentials.json",
+            token_path="token.json",
+        ),
+        ui=UIConfigSafe(host="127.0.0.1", port=8765),
+        poll_interval_minutes=5,
+        state_db_path="state.db",
+        gmail_connected=_gmail_connected(),
+        imap_password_set=False,
+        config_exists=False,
+    )
+
+
 @app.get("/api/config", response_model=ConfigResponse)
 def api_config(request: Request) -> ConfigResponse:
     """Return non-sensitive config for display/editing (no password resolution)."""
     if not _require_auth(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
+    path = _get_config_path()
+    if not path.exists():
+        return _default_config_response()
     try:
-        cfg = load_config(_get_config_path(), resolve_password=False)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="config.json not found")
+        cfg = load_config(path, resolve_password=False)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     imap = cfg.get("imap") or {}
@@ -345,6 +378,7 @@ def api_config(request: Request) -> ConfigResponse:
         state_db_path=str(state.get("db_path", "state.db")),
         gmail_connected=_gmail_connected(),
         imap_password_set=_imap_password_set(),
+        config_exists=True,
     )
 
 
@@ -592,6 +626,7 @@ _HTML_PAGE = """
 <body>
   <h1>Fetch2Gmail <span class="logout" id="logoutSpan" style="display:none"><form method="post" action="/api/logout" style="display:inline"><button type="submit">Log out</button></form></span></h1>
   <p id="subtitle">IMAP to Gmail import. Configure below.</p>
+  <p id="loggedOutMsg" style="display:none" class="status"></p>
   <p id="loadingMsg">Loading...</p>
 
   <div id="credentialsFirst" style="display:none">
@@ -701,12 +736,23 @@ _APP_JS = r"""
     document.getElementById('subtitle').textContent = 'Gmail connected. You can run a fetch now.';
     history.replaceState({}, '', '/');
   }
+  if (params.get('logged_out') === '1') {
+    var el = document.getElementById('loggedOutMsg');
+    el.style.display = 'block';
+    el.textContent = 'You clicked Log out. When using password protection, the browser may still send your password. To fully log out, close this tab or use a private window.';
+    history.replaceState({}, '', '/');
+  }
   if (params.get('error') === 'no_credentials') document.getElementById('subtitle').innerHTML = '<span class="error">Put credentials.json in the app folder and try Connect Gmail again.</span>';
 
   function hideLoading() { var el = document.getElementById('loadingMsg'); if (el) el.style.display = 'none'; }
   function loadConfig() {
     return api('/api/config').then(function(c) {
       hideLoading();
+      if (!c.config_exists) {
+        document.getElementById('dashboard').style.display = 'none';
+        document.getElementById('setupWizard').style.display = 'block';
+        return null;
+      }
       document.getElementById('setupWizard').style.display = 'none';
       document.getElementById('dashboard').style.display = 'block';
       document.getElementById('imap_host').value = c.imap.host;
