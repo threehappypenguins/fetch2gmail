@@ -14,6 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify version
+        run: |
+          V=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
+          echo "Building version: $V"
+          if [ -z "$V" ]; then echo "::error::Could not read version from pyproject.toml"; exit 1; fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
