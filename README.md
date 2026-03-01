@@ -209,9 +209,32 @@ All app files live in **one directory**: **config.json**, **credentials.json**, 
 | `fetch2gmail run` | Run one fetch cycle. |
 | `fetch2gmail run --dry-run` | Connect to ISP and show what would be imported; no Gmail import, no delete. |
 
-### Uninstall (computer used only for token)
+### Uninstall
 
-After copying **credentials.json** and **token.json** to the server, you can remove fetch2gmail from that computer: `pipx uninstall fetch2gmail`. Reinstall with `pipx install fetch2gmail` if you need to run `fetch2gmail auth` again later.
+**Machine used only to get the token (no system service):** After copying **credentials.json** and **token.json** to the server, remove the app: `pipx uninstall fetch2gmail`. Reinstall with `pipx install fetch2gmail` if you need to run `fetch2gmail auth` again later.
+
+**Machine where the app runs (system service + app):** To remove everything so you can reinstall or run from source and see your changes:
+
+1. **Stop and disable the systemd service, then remove the unit file:**
+   ```bash
+   sudo systemctl stop fetch2gmail
+   sudo systemctl disable fetch2gmail
+   sudo rm /etc/systemd/system/fetch2gmail.service
+   sudo systemctl daemon-reload
+   ```
+   (To confirm the service is gone: `systemctl status fetch2gmail` should report "not found".)
+
+2. **Uninstall the app:**
+   - **If you installed with pipx:** `pipx uninstall fetch2gmail`
+   - **If you installed from source in a venv:** deactivate the venv (`deactivate`) and delete the project directory (e.g. `rm -rf ~/fetch2gmail`), or just use a different terminal and run from your dev clone with `pip install -e .` so the installed copy is no longer used.
+
+3. **Optionally remove the data directory** (config, credentials, token, state, UI password file):
+   ```bash
+   rm -rf /opt/fetch2gmail
+   ```
+   Use the path you used as the data directory (e.g. `/opt/fetch2gmail` or `~/fetch2gmail`). Only do this if you no longer need the config or token; back them up first if you might reuse them.
+
+**To test local changes:** Uninstall the system copy (steps 1 and 2 above), then from your git clone run `python3 -m venv .venv`, `source .venv/bin/activate`, `pip install -e .`. Use that terminal to run `fetch2gmail serve` (or reinstall the system service later with `fetch2gmail install-service` and point it at your data directory).
 
 ---
 
