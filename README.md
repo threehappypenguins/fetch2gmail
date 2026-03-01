@@ -252,6 +252,22 @@ You’ll see messages like "Poller: next fetch in Xs", "Poller: running fetch no
   - **`--host 0.0.0.0`** — Bind to all interfaces (e.g. to reach the UI from another device on the LAN). Default is 127.0.0.1 (localhost only).
   - **`FETCH2GMAIL_CONFIG=/path/to/config.json`** — Use a different data directory. The path must be the **full path to config.json** inside that directory; the app will look for credentials, token, and .env in the same directory. Use this when you run `fetch2gmail serve` from one place (e.g. your git clone) but want to use config and data from another (e.g. `/home/sarah/Desktop/config.json`).
 
+### Updating
+
+If you installed with **pipx**, upgrade to the latest release with:
+
+```bash
+pipx upgrade fetch2gmail
+```
+
+You do **not** need to stop the service, remove the systemd unit, or uninstall first. The service will use the new version the next time it runs (e.g. after a reboot), or restart it now to pick up the update:
+
+```bash
+sudo systemctl restart fetch2gmail
+```
+
+Your config, token, and data directory are unchanged.
+
 ### Uninstall
 
 **Machine used only to get the token (no system service):** After copying **credentials.json** and **token.json** to the server, remove the app: `pipx uninstall fetch2gmail`. Reinstall with `pipx install fetch2gmail` if you need to run `fetch2gmail auth` again later.
