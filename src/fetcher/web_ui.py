@@ -228,19 +228,19 @@ def api_auth_required() -> dict[str, Any]:
 
 @app.get("/api/auth/session")
 def api_auth_session(request: Request) -> dict[str, bool]:
-    """Whether the current request is logged in (UI password passed, or Google session, or no auth)."""
+    """Whether the current request is logged in; ui_password_mode=True when .ui_auth is used (hide Log out)."""
     cfg_dir = _config_dir_safe()
     if load_ui_auth(cfg_dir):
-        return {"logged_in": True}
-    return {"logged_in": verify_request(request, cfg_dir, _config_exists())}
+        return {"logged_in": True, "ui_password_mode": True}
+    return {"logged_in": verify_request(request, cfg_dir, _config_exists()), "ui_password_mode": False}
 
 
 @app.post("/api/logout")
 def api_logout():
-    """Clear session and redirect. With Basic Auth, browser may still re-send credentials; redirect to / with hint."""
+    """Clear session and redirect. Log out button is hidden when .ui_auth is used (Basic Auth cannot be cleared from the page)."""
     cfg_dir = _config_dir_safe()
     if load_ui_auth(cfg_dir):
-        resp = RedirectResponse(url="/?logged_out=1", status_code=302)
+        resp = RedirectResponse(url="/", status_code=302)
     else:
         resp = RedirectResponse(url="/login", status_code=302)
     clear_session_cookie(resp)
@@ -626,7 +626,6 @@ _HTML_PAGE = """
 <body>
   <h1>Fetch2Gmail <span class="logout" id="logoutSpan" style="display:none"><form method="post" action="/api/logout" style="display:inline"><button type="submit">Log out</button></form></span></h1>
   <p id="subtitle">IMAP to Gmail import. Configure below.</p>
-  <p id="loggedOutMsg" style="display:none" class="status"></p>
   <p id="loadingMsg">Loading...</p>
 
   <div id="credentialsFirst" style="display:none">
@@ -723,7 +722,7 @@ _APP_JS = r"""
         document.getElementById('landing').style.display = 'block';
         return;
       }
-      document.getElementById('logoutSpan').style.display = 'inline';
+      if (!session.ui_password_mode) document.getElementById('logoutSpan').style.display = 'inline';
       loadConfig().then(function(c) { if (c) { loadStatus(); loadLogs(); } });
     }).catch(function() {
       document.getElementById('loadingMsg').style.display = 'none';
@@ -734,12 +733,6 @@ _APP_JS = r"""
   var params = new URLSearchParams(location.search);
   if (params.get('gmail') === 'connected') {
     document.getElementById('subtitle').textContent = 'Gmail connected. You can run a fetch now.';
-    history.replaceState({}, '', '/');
-  }
-  if (params.get('logged_out') === '1') {
-    var el = document.getElementById('loggedOutMsg');
-    el.style.display = 'block';
-    el.textContent = 'You clicked Log out. When using password protection, the browser may still send your password. To fully log out, close this tab or use a private window.';
     history.replaceState({}, '', '/');
   }
   if (params.get('error') === 'no_credentials') document.getElementById('subtitle').innerHTML = '<span class="error">Put credentials.json in the app folder and try Connect Gmail again.</span>';
