@@ -41,7 +41,7 @@ def _index() -> str:
     </body></html>"""
 
 
-@app.get("/auth/gmail")
+@app.get("/auth/gmail", response_model=None)
 def _auth_start(request: Request) -> RedirectResponse:
     cred_path = _credentials_path()
     if not cred_path.exists():
@@ -60,7 +60,7 @@ def _auth_start(request: Request) -> RedirectResponse:
     return RedirectResponse(url=auth_url, status_code=302)
 
 
-@app.get("/auth/gmail/callback")
+@app.get("/auth/gmail/callback", response_model=None)
 def _auth_callback(
     request: Request,
     code: str | None = None,
