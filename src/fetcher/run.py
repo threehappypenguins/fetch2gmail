@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import load_config
 from .gmail_client import (
+    SkipMessageError,
     _parse_message_id_from_raw,
     get_gmail_service,
     get_inbox_label_id,
@@ -166,6 +167,9 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
             state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
             imported += 1
             logger.info("Imported uid=%s -> Gmail id=%s", msg.uid, gmail_id)
+        except SkipMessageError as e:
+            logger.warning("Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e)
+            continue
         except Exception as e:
             logger.exception("Gmail import failed for uid=%s: %s", msg.uid, e)
             # Do not delete from ISP; do not advance last_uid. Next run will retry.
@@ -350,6 +354,9 @@ def run_copy_all(
             state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
             imported += 1
             logger.info("Copy-all imported uid=%s -> Gmail id=%s", msg.uid, gmail_id)
+        except SkipMessageError as e:
+            logger.warning("Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e)
+            continue
         except Exception as e:
             logger.exception("Gmail import failed for uid=%s: %s", msg.uid, e)
             continue

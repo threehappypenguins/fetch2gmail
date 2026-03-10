@@ -12,6 +12,11 @@ from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
+# Raised when a message cannot be normalized for Gmail (e.g. no From/Sender/Reply-To).
+class SkipMessageError(ValueError):
+    """Message should be skipped for import (e.g. missing From)."""
+    pass
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -53,20 +58,27 @@ def get_gmail_service(credentials_path: str | Path, token_path: str | Path):
 def _normalize_from_header(raw: bytes) -> bytes:
     """
     Ensure the message has exactly one From header. Gmail import requires it.
-    Some ISP messages have none or multiple From headers and would otherwise get 400.
+    - Multiple From: keep the first.
+    - No From: use Sender or Reply-To if present; otherwise raise SkipMessageError
+      so the message is skipped (never inject a fake address).
     """
     try:
         msg = BytesParser(policy=policy.default).parsebytes(raw)
         from_vals = msg.get_all("From") or []
         if len(from_vals) == 0:
-            msg["From"] = "unknown@unknown.local"
-            logger.debug("Message had no From header; added placeholder")
+            fallback = (msg.get("Sender") or msg.get("Reply-To") or "").strip()
+            if not fallback:
+                raise SkipMessageError("Message has no From, Sender, or Reply-To header")
+            msg["From"] = fallback
+            logger.debug("Message had no From header; using %s", fallback[:50])
         elif len(from_vals) > 1:
             msg["From"] = from_vals[0]
             logger.debug("Message had %s From headers; kept first", len(from_vals))
         else:
             return raw
         return msg.as_bytes()
+    except SkipMessageError:
+        raise
     except Exception:  # noqa: BLE001
         return raw
 
