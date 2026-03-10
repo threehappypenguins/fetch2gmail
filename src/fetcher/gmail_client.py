@@ -50,6 +50,27 @@ def get_gmail_service(credentials_path: str | Path, token_path: str | Path):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _normalize_from_header(raw: bytes) -> bytes:
+    """
+    Ensure the message has exactly one From header. Gmail import requires it.
+    Some ISP messages have none or multiple From headers and would otherwise get 400.
+    """
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        from_vals = msg.get_all("From") or []
+        if len(from_vals) == 0:
+            msg["From"] = "unknown@unknown.local"
+            logger.debug("Message had no From header; added placeholder")
+        elif len(from_vals) > 1:
+            msg["From"] = from_vals[0]
+            logger.debug("Message had %s From headers; kept first", len(from_vals))
+        else:
+            return raw
+        return msg.as_bytes()
+    except Exception:  # noqa: BLE001
+        return raw
+
+
 def _parse_date_from_raw(raw: bytes) -> str | None:
     """Extract Date header from raw message for Gmail internalDate."""
     try:
@@ -102,6 +123,7 @@ def import_message(
     If mark_unread is False (message was read on ISP), the message is imported as read.
     Returns Gmail message ID.
     """
+    raw = _normalize_from_header(raw)
     body = {"raw": base64.urlsafe_b64encode(raw).decode("ascii")}
     internal_date = _parse_date_from_raw(raw)
     if internal_date:
