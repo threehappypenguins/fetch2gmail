@@ -502,6 +502,7 @@ class ConfigUpdate(BaseModel):
     imap_port: int | None = None
     imap_username: str | None = None
     imap_mailbox: str | None = None
+    imap_use_ssl: bool | None = None
     imap_password: str | None = None  # stored in .env, not in config
     delete_after_import: bool | None = None
     gmail_use_label: bool | None = None
@@ -517,6 +518,7 @@ class SetupBody(BaseModel):
     imap_username: str
     imap_password: str
     imap_mailbox: str = "INBOX"
+    imap_use_ssl: bool = True
     delete_after_import: bool = True
     gmail_use_label: bool = False
     gmail_label: str = "ISP Mail"
@@ -540,7 +542,7 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
             username=body.imap_username,
             password=body.imap_password,
             mailbox=body.imap_mailbox,
-            use_ssl=True,
+            use_ssl=body.imap_use_ssl,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -552,7 +554,7 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
             "username": body.imap_username,
             "password_env": "IMAP_PASSWORD",
             "mailbox": body.imap_mailbox,
-            "use_ssl": True,
+            "use_ssl": body.imap_use_ssl,
             "delete_after_import": body.delete_after_import,
         },
         "gmail": {
@@ -590,7 +592,7 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         port = int(update.imap_port if update.imap_port is not None else imap.get("port", 993))
         username = update.imap_username if update.imap_username is not None else imap.get("username", "")
         mailbox = update.imap_mailbox if update.imap_mailbox is not None else imap.get("mailbox", "INBOX")
-        use_ssl = imap.get("use_ssl", True)
+        use_ssl = update.imap_use_ssl if update.imap_use_ssl is not None else imap.get("use_ssl", True)
         try:
             _verify_imap_credentials(
                 host=host,
@@ -614,6 +616,8 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         imap["username"] = update.imap_username
     if update.imap_mailbox is not None:
         imap["mailbox"] = update.imap_mailbox
+    if update.imap_use_ssl is not None:
+        imap["use_ssl"] = update.imap_use_ssl
     if update.delete_after_import is not None:
         cfg.setdefault("imap", {})["delete_after_import"] = update.delete_after_import
     if update.gmail_use_label is not None:
@@ -763,6 +767,8 @@ _HTML_PAGE = """
       <p>Enter your IMAP (ISP) mailbox details. Your password is stored encrypted in <code>.env</code> (not plain text), not in the config file.</p>
       <label>IMAP host <input id="s_imap_host" type="text" placeholder="imap.example.com"></label>
       <label>IMAP port <input id="s_imap_port" type="number" value="993"></label>
+      <label style="display:inline-block; margin-top:0.25rem;"><input type="checkbox" id="s_imap_use_ssl" checked> Use SSL/TLS for IMAP</label>
+      <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Uncheck for plain IMAP (e.g. port 143).</p>
       <label>IMAP username (email) <input id="s_imap_username" type="text" placeholder="you@isp.com"></label>
       <label>IMAP password <input id="s_imap_password" type="password" placeholder="Stored encrypted in .env"></label>
       <label>Mailbox <input id="s_imap_mailbox" type="text" value="INBOX" title="IMAP folder to fetch from. INBOX is the main inbox where new mail arrives."></label>
@@ -815,6 +821,8 @@ _HTML_PAGE = """
     <h2>Config</h2>
     <label>IMAP host <input id="imap_host" type="text"></label>
     <label>IMAP port <input id="imap_port" type="number"></label>
+    <label style="display:inline-block; margin-top:0.25rem;"><input type="checkbox" id="imap_use_ssl"> Use SSL/TLS for IMAP</label>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Uncheck for plain IMAP (e.g. port 143).</p>
     <label>IMAP username <input id="imap_username" type="text"></label>
     <label>IMAP password <input id="imap_password" type="password" placeholder="Leave blank to keep current (stored encrypted)"></label>
     <label>Mailbox <input id="imap_mailbox" type="text" title="IMAP folder to fetch from. INBOX = main inbox."></label>
@@ -883,6 +891,7 @@ _APP_JS = r"""
       document.getElementById('dashboard').style.display = 'block';
       document.getElementById('imap_host').value = c.imap.host;
       document.getElementById('imap_port').value = c.imap.port;
+      document.getElementById('imap_use_ssl').checked = c.imap.use_ssl;
       document.getElementById('imap_username').value = c.imap.username;
       document.getElementById('imap_mailbox').value = c.imap.mailbox;
       document.getElementById('delete_after_import').checked = c.imap.delete_after_import;
@@ -1047,6 +1056,7 @@ _APP_JS = r"""
     var body = {
       imap_host: document.getElementById('imap_host').value,
       imap_port: parseInt(document.getElementById('imap_port').value, 10),
+      imap_use_ssl: document.getElementById('imap_use_ssl').checked,
       imap_username: document.getElementById('imap_username').value,
       imap_mailbox: document.getElementById('imap_mailbox').value,
       delete_after_import: document.getElementById('delete_after_import').checked,
@@ -1076,9 +1086,10 @@ _APP_JS = r"""
     fetch('/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+        body: JSON.stringify({
         imap_host: document.getElementById('s_imap_host').value,
         imap_port: parseInt(document.getElementById('s_imap_port').value, 10),
+        imap_use_ssl: document.getElementById('s_imap_use_ssl').checked,
         imap_username: document.getElementById('s_imap_username').value,
         imap_password: document.getElementById('s_imap_password').value,
         imap_mailbox: document.getElementById('s_imap_mailbox').value,
