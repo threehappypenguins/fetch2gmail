@@ -42,7 +42,8 @@ def _ensure_label(service: Any, label_name: str) -> str:
 
 def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str, Any]:
     """
-    Run one fetch cycle: fetch from IMAP, import to Gmail, update state, delete from ISP.
+    Run one fetch cycle: fetch NEW mail only (UID > last_processed), import to Gmail, update state, delete from ISP.
+    New messages are always imported as unread (used by Run fetch now and by the polling interval).
 
     If dry_run is True: fetch from ISP and simulate import (log only), do not delete.
     Returns dict with counts and last_fetch_time for UI.
@@ -154,6 +155,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
 
         try:
             label_ids = [label_id] if label_id else []
+            # Fetch/polling only gets NEW mail (UID > last); always import as unread.
             gmail_id = import_message(
                 service,
                 USER_ID,
@@ -161,7 +163,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                 label_ids=label_ids,
                 inbox_label_id=inbox_label_id,
                 unread_label_id=unread_label_id,
-                mark_unread=not msg.is_seen,
+                mark_unread=True,
             )
             state.record_import(msg.message_hash, gmail_id, mailbox, uid_validity, msg.uid)
             state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
@@ -341,6 +343,7 @@ def run_copy_all(
 
         try:
             label_ids = [label_id] if label_id else []
+            # Copy-all: preserve read/unread from ISP (\Seen).
             gmail_id = import_message(
                 service,
                 USER_ID,

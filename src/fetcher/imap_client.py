@@ -125,7 +125,8 @@ def fetch_messages(
         else:
             conn = imaplib.IMAP4(host, port=port)
         conn.login(username, password)
-        conn.select(mailbox, readonly=False)
+        # Use read-only so the server does not set \Seen when we FETCH (preserves unread in Gmail).
+        conn.select(mailbox, readonly=True)
         # Get UIDVALIDITY for this mailbox
         status = conn.status(mailbox, "(UIDVALIDITY)")
         # e.g. STATUS INBOX (UIDVALIDITY 12345)
