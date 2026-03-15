@@ -10,6 +10,7 @@ import hashlib
 import imaplib
 import logging
 import ssl
+import datetime
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -102,6 +103,15 @@ def get_uid_validity(
             pass
 
 
+def _format_imap_date(date_val: str | datetime.date) -> str:
+    """Convert an ISO date string or date object to IMAP DD-MMM-YYYY."""
+    if isinstance(date_val, str):
+        date_val = datetime.date.fromisoformat(date_val)
+    if not isinstance(date_val, datetime.date):
+        raise TypeError("since_date must be a date or ISO date string")
+    return date_val.strftime("%d-%b-%Y")
+
+
 def fetch_messages(
     host: str,
     port: int,
@@ -110,11 +120,14 @@ def fetch_messages(
     mailbox: str = "INBOX",
     use_ssl: bool = True,
     last_processed_uid: int | None = None,
+    since: str | datetime.date | None = None,
 ) -> tuple[int, Iterator[FetchedMessage]]:
     """
     Connect via IMAPS, select mailbox, return (uid_validity, iterator of new messages).
 
-    Messages are those with UID > last_processed_uid. Ordered by ascending UID.
+    Messages are those with UID > last_processed_uid and, if since is
+    provided, whose INTERNALDATE is on or after that date.
+
     Caller must handle UIDVALIDITY changes (e.g. reset state when it changes).
     """
     ssl_context = ssl.create_default_context() if use_ssl else None
@@ -131,12 +144,16 @@ def fetch_messages(
         status = conn.status(mailbox, "(UIDVALIDITY)")
         # e.g. STATUS INBOX (UIDVALIDITY 12345)
         uid_validity = int(status[1][0].decode().split("UIDVALIDITY")[1].strip(" ()"))
-        # Search UIDs > last_processed_uid (all if last_processed_uid is None)
+        # Search UIDs > last_processed_uid (all if last_processed_uid is None) and optionally SINCE date.
+        criteria_parts: list[str] = []
         if last_processed_uid is not None:
-            search_criteria = f"UID {last_processed_uid + 1}:*"
+            criteria_parts.append(f"UID {last_processed_uid + 1}:*")
         else:
-            search_criteria = "UID 1:*"
-        _, data = conn.uid("SEARCH", None, search_criteria)
+            criteria_parts.append("UID 1:*")
+        if since is not None:
+            imap_date = _format_imap_date(since)
+            criteria_parts.append(f"SINCE {imap_date}")
+        _, data = conn.uid("SEARCH", None, " ".join(criteria_parts))
         if not data or not data[0]:
             try:
                 conn.logout()
