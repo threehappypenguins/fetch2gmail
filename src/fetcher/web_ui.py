@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -221,6 +222,7 @@ class ImapConfigSafe(BaseModel):
     mailbox: str
     use_ssl: bool
     delete_after_import: bool
+    since_date: str | None = None
 
 
 class GmailConfigSafe(BaseModel):
@@ -432,6 +434,7 @@ def _default_config_response() -> ConfigResponse:
             mailbox="INBOX",
             use_ssl=True,
             delete_after_import=True,
+            since_date=None,
         ),
         gmail=GmailConfigSafe(
             use_label=False,
@@ -476,6 +479,7 @@ def api_config(request: Request) -> ConfigResponse:
             mailbox=imap.get("mailbox", "INBOX"),
             use_ssl=imap.get("use_ssl", True),
             delete_after_import=imap.get("delete_after_import", True),
+            since_date=imap.get("since_date"),
         ),
         gmail=GmailConfigSafe(
             use_label=gmail.get("use_label") if "use_label" in gmail else bool((gmail.get("label") or "").strip()),
@@ -503,6 +507,7 @@ class ConfigUpdate(BaseModel):
     imap_username: str | None = None
     imap_mailbox: str | None = None
     imap_use_ssl: bool | None = None
+    imap_since_date: str | None = None
     imap_password: str | None = None  # stored in .env, not in config
     delete_after_import: bool | None = None
     gmail_use_label: bool | None = None
@@ -535,6 +540,11 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
     path = _get_config_path()
     if path.exists():
         raise HTTPException(status_code=400, detail="Config already exists")
+    if body.imap_since_date:
+        try:
+            datetime.date.fromisoformat(body.imap_since_date)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="since_date must be YYYY-MM-DD")
     try:
         _verify_imap_credentials(
             host=body.imap_host,
@@ -554,6 +564,7 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
             "username": body.imap_username,
             "password_env": "IMAP_PASSWORD",
             "mailbox": body.imap_mailbox,
+            "since_date": body.imap_since_date,
             "use_ssl": body.imap_use_ssl,
             "delete_after_import": body.delete_after_import,
         },
@@ -616,6 +627,13 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         imap["username"] = update.imap_username
     if update.imap_mailbox is not None:
         imap["mailbox"] = update.imap_mailbox
+    if update.imap_since_date is not None:
+        try:
+            if update.imap_since_date != "":
+                datetime.date.fromisoformat(update.imap_since_date)
+        except Exception:
+            raise HTTPException(status_code=400, detail="since_date must be YYYY-MM-DD")
+        cfg.setdefault("imap", {})["since_date"] = update.imap_since_date
     if update.imap_use_ssl is not None:
         imap["use_ssl"] = update.imap_use_ssl
     if update.delete_after_import is not None:
@@ -773,6 +791,7 @@ _HTML_PAGE = """
       <label>IMAP password <input id="s_imap_password" type="password" placeholder="Stored encrypted in .env"></label>
       <label>Mailbox <input id="s_imap_mailbox" type="text" value="INBOX" title="IMAP folder to fetch from. INBOX is the main inbox where new mail arrives."></label>
       <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Mailbox is the IMAP folder to fetch from. <strong>INBOX</strong> is the main inbox where new mail arrives at your ISP; leave as INBOX unless you use a different folder.</p>
+      <label>Only fetch mail newer than <input id="s_imap_since_date" type="date"></label>
       <label style="margin-top:1rem;"><input type="checkbox" id="s_delete_after_import" checked> Delete emails from ISP after importing to Gmail</label>
       <label><input type="checkbox" id="s_gmail_use_label"> Add a Gmail label to imported mail</label>
       <div id="s_gmail_label_row" style="display:none;"><label>Label name <input id="s_gmail_label" type="text" value="ISP Mail" placeholder="e.g. ISP Mail"></label></div>
@@ -827,6 +846,7 @@ _HTML_PAGE = """
     <label>IMAP password <input id="imap_password" type="password" placeholder="Leave blank to keep current (stored encrypted)"></label>
     <label>Mailbox <input id="imap_mailbox" type="text" title="IMAP folder to fetch from. INBOX = main inbox."></label>
     <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Mailbox is the IMAP folder to fetch from. <strong>INBOX</strong> = main inbox where new mail arrives.</p>
+    <label>Only fetch mail newer than <input id="imap_since_date" type="date"></label>
     <label style="margin-top:1rem;"><input type="checkbox" id="delete_after_import"> Delete emails from ISP after importing to Gmail</label>
     <label><input type="checkbox" id="gmail_use_label"> Add a Gmail label to imported mail</label>
     <div id="gmail_label_row" style="display:none;"><label>Label name <input id="gmail_label" type="text" placeholder="e.g. ISP Mail"></label></div>
@@ -894,6 +914,7 @@ _APP_JS = r"""
       document.getElementById('imap_use_ssl').checked = c.imap.use_ssl;
       document.getElementById('imap_username').value = c.imap.username;
       document.getElementById('imap_mailbox').value = c.imap.mailbox;
+      document.getElementById('imap_since_date').value = c.imap.since_date || '';
       document.getElementById('delete_after_import').checked = c.imap.delete_after_import;
       document.getElementById('gmail_use_label').checked = c.gmail.use_label;
       document.getElementById('gmail_label_row').style.display = c.gmail.use_label ? 'block' : 'none';
@@ -1059,6 +1080,7 @@ _APP_JS = r"""
       imap_use_ssl: document.getElementById('imap_use_ssl').checked,
       imap_username: document.getElementById('imap_username').value,
       imap_mailbox: document.getElementById('imap_mailbox').value,
+      imap_since_date: document.getElementById('imap_since_date').value || null,
       delete_after_import: document.getElementById('delete_after_import').checked,
       gmail_use_label: document.getElementById('gmail_use_label').checked,
       gmail_label: document.getElementById('gmail_label').value,
@@ -1093,6 +1115,7 @@ _APP_JS = r"""
         imap_username: document.getElementById('s_imap_username').value,
         imap_password: document.getElementById('s_imap_password').value,
         imap_mailbox: document.getElementById('s_imap_mailbox').value,
+        imap_since_date: document.getElementById('s_imap_since_date').value || null,
         delete_after_import: document.getElementById('s_delete_after_import').checked,
         gmail_use_label: document.getElementById('s_gmail_use_label').checked,
         gmail_label: document.getElementById('s_gmail_label').value
