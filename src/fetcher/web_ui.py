@@ -1163,11 +1163,23 @@ _APP_JS = r"""
       document.getElementById('gmailStatus').innerHTML = c.gmail_connected ? '<span class="ok">Gmail connected</span>' : '<span class="error">Not connected (add token.json from fetch2gmail auth)</span>';
       document.getElementById('gmailEmail').textContent = '';
       if (c.gmail_connected) {
+        var configuredPaths = {};
+        var accounts = ensureGmailAccounts(c);
+        for (var ai = 0; ai < accounts.length; ai++) {
+          var tp = (accounts[ai].token_path || '').trim();
+          if (tp) configuredPaths[tp] = true;
+          var base = tp.split(/[/\\\\]/).pop();
+          if (base) configuredPaths[base] = true;
+        }
         api('/api/gmail/discover-tokens').then(function(tokens) {
           if (!Array.isArray(tokens) || !tokens.length) return;
           var emails = [];
           for (var i = 0; i < tokens.length; i++) {
-            if (tokens[i].email) emails.push(tokens[i].email);
+            var t = tokens[i];
+            if (!t.email) continue;
+            var path = (t.token_path || '').trim();
+            var base = path.split(/[/\\\\]/).pop();
+            if (configuredPaths[path] || configuredPaths[base]) emails.push(t.email);
           }
           if (!emails.length) return;
           var uniq = [];
