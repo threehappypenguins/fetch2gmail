@@ -5,7 +5,8 @@
     "username": "your-isp-email@example.com",
     "password_env": "IMAP_PASSWORD",
     "mailbox": "INBOX",
-    "use_ssl": true
+    "use_ssl": true,
+    "delete_after_import": true
   },
   "gmail": {
     "label": "ISP Mail",

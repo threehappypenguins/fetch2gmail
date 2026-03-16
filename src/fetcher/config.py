@@ -51,3 +51,18 @@ def get_config_path() -> Path:
     if env:
         return Path(env)
     return Path.cwd() / "config.json"
+
+
+def get_gmail_accounts(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return list of Gmail account configs for import.
+    Supports multi-account: use "gmail_accounts" (array) or legacy "gmail" (single object).
+    If both present, "gmail_accounts" wins. Each entry has credentials_path, token_path, label, use_label.
+    """
+    accounts = cfg.get("gmail_accounts")
+    if isinstance(accounts, list) and len(accounts) > 0:
+        return accounts
+    gmail = cfg.get("gmail")
+    if gmail and isinstance(gmail, dict):
+        return [gmail]
+    return []

@@ -270,7 +270,8 @@ def _write_default_config(dest: Path) -> None:
             "use_ssl": True,
             "delete_after_import": True,
         },
-        "gmail": {"use_label": False, "label": "ISP Mail", "credentials_path": "credentials.json", "token_path": "token.json"},
+        # Canonical: gmail_accounts (multi-account). Single-account setups will have one entry.
+        "gmail_accounts": [{"use_label": False, "label": "ISP Mail", "credentials_path": "credentials.json", "token_path": "token.json"}],
         "state": {"db_path": "state.db"},
         "ui": {"host": "127.0.0.1", "port": 8765},
         "poll_interval_minutes": 5,
@@ -302,7 +303,7 @@ def config_wizard_interactive() -> None:
             "use_ssl": True,
             "delete_after_import": True,
         },
-        "gmail": {"use_label": bool(label), "label": label or "ISP Mail", "credentials_path": cred_path, "token_path": token_path},
+        "gmail_accounts": [{"use_label": bool(label), "label": label or "ISP Mail", "credentials_path": cred_path, "token_path": token_path}],
         "state": {"db_path": db_path},
         "ui": {"host": "127.0.0.1", "port": 8765},
         "poll_interval_minutes": 5,

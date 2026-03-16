@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 import imaplib
 
-from .config import get_config_path, load_config
+from .config import get_config_path, get_gmail_accounts, load_config
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
 from .imap_client import get_uid_validity
@@ -175,16 +175,22 @@ def _config_exists() -> bool:
 
 
 def _token_exists() -> bool:
-    """True when config exists and the configured token file exists."""
+    """True when config exists and every Gmail account has its token file."""
     cfg_dir = _config_dir_safe()
     if not cfg_dir or not _config_exists():
         return False
     try:
         cfg = load_config(_get_config_path(), resolve_password=False)
-        token_path = Path((cfg.get("gmail") or {}).get("token_path", "token.json"))
-        if not token_path.is_absolute():
-            token_path = cfg_dir / token_path
-        return token_path.exists()
+        accounts = get_gmail_accounts(cfg)
+        if not accounts:
+            return False
+        for acct in accounts:
+            token_path = Path(acct.get("token_path", "token.json"))
+            if not token_path.is_absolute():
+                token_path = cfg_dir / token_path
+            if not token_path.exists():
+                return False
+        return True
     except Exception:
         return False
 
@@ -230,6 +236,13 @@ class GmailConfigSafe(BaseModel):
     token_path: str
 
 
+class GmailAccountSafe(BaseModel):
+    use_label: bool
+    label: str
+    credentials_path: str
+    token_path: str
+
+
 class UIConfigSafe(BaseModel):
     host: str
     port: int
@@ -238,6 +251,7 @@ class UIConfigSafe(BaseModel):
 class ConfigResponse(BaseModel):
     imap: ImapConfigSafe
     gmail: GmailConfigSafe
+    gmail_accounts: list[GmailAccountSafe] = []
     ui: UIConfigSafe
     poll_interval_minutes: int
     state_db_path: str
@@ -336,27 +350,20 @@ def index(request: Request) -> str:
 
 
 def _gmail_connected() -> bool:
-    path = _get_config_path()
-    if not path.exists():
-        return False
-    try:
-        cfg = load_config(path, resolve_password=False)
-        token_path = (cfg.get("gmail") or {}).get("token_path", "token.json")
-        tp = Path(token_path)
-        if not tp.is_absolute():
-            tp = _config_dir() / token_path
-        return tp.exists()
-    except Exception:
-        return False
+    """True when all configured Gmail accounts have token files (and can be used for fetch)."""
+    return _token_exists()
 
 
 def _gmail_email() -> str | None:
-    """Return the Gmail address for the current token, or None if not connected or error."""
+    """Return the Gmail address for the first account, or None if not connected or error."""
     if not _gmail_connected():
         return None
     try:
         cfg = load_config(_get_config_path(), resolve_password=False)
-        gmail = cfg.get("gmail") or {}
+        accounts = get_gmail_accounts(cfg)
+        if not accounts:
+            return None
+        gmail = accounts[0]
         cred_path = Path(gmail.get("credentials_path", "credentials.json"))
         token_path = Path(gmail.get("token_path", "token.json"))
         if not cred_path.is_absolute():
@@ -439,6 +446,14 @@ def _default_config_response() -> ConfigResponse:
             credentials_path="credentials.json",
             token_path="token.json",
         ),
+        gmail_accounts=[
+            GmailAccountSafe(
+                use_label=False,
+                label="ISP Mail",
+                credentials_path="credentials.json",
+                token_path="token.json",
+            )
+        ],
         ui=UIConfigSafe(host="127.0.0.1", port=8765),
         poll_interval_minutes=5,
         state_db_path="state.db",
@@ -463,11 +478,22 @@ def api_config(request: Request) -> ConfigResponse:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     imap = cfg.get("imap") or {}
-    gmail = cfg.get("gmail") or {}
+    gmail_accounts = get_gmail_accounts(cfg)
+    gmail = gmail_accounts[0] if gmail_accounts else {}
     ui = cfg.get("ui") or {}
     state = cfg.get("state") or {}
     cred_path = gmail.get("credentials_path", "credentials.json")
     token_path = gmail.get("token_path", "token.json")
+    gmail_accounts_safe: list[GmailAccountSafe] = []
+    for acct in gmail_accounts:
+        gmail_accounts_safe.append(
+            GmailAccountSafe(
+                use_label=acct.get("use_label") if "use_label" in acct else bool((acct.get("label") or "").strip()),
+                label=acct.get("label", "ISP Mail"),
+                credentials_path=acct.get("credentials_path", "credentials.json"),
+                token_path=acct.get("token_path", "token.json"),
+            )
+        )
     return ConfigResponse(
         imap=ImapConfigSafe(
             host=imap.get("host", ""),
@@ -483,6 +509,7 @@ def api_config(request: Request) -> ConfigResponse:
             credentials_path=cred_path,
             token_path=token_path,
         ),
+        gmail_accounts=gmail_accounts_safe,
         ui=UIConfigSafe(
             host=ui.get("host", "127.0.0.1"),
             port=int(ui.get("port", 8765)),
@@ -507,6 +534,7 @@ class ConfigUpdate(BaseModel):
     delete_after_import: bool | None = None
     gmail_use_label: bool | None = None
     gmail_label: str | None = None
+    gmail_accounts: list[GmailAccountSafe] | None = None
     poll_interval_minutes: int | None = None
     state_db_path: str | None = None
 
@@ -557,12 +585,15 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
             "use_ssl": body.imap_use_ssl,
             "delete_after_import": body.delete_after_import,
         },
-        "gmail": {
-            "use_label": body.gmail_use_label,
-            "label": body.gmail_label,
-            "credentials_path": body.credentials_path,
-            "token_path": body.token_path,
-        },
+        # Canonical: gmail_accounts. Keep legacy readers working via get_gmail_accounts().
+        "gmail_accounts": [
+            {
+                "use_label": body.gmail_use_label,
+                "label": body.gmail_label,
+                "credentials_path": body.credentials_path,
+                "token_path": body.token_path,
+            }
+        ],
         "state": {"db_path": body.state_db_path},
         "ui": {"host": "127.0.0.1", "port": 8765},
         "poll_interval_minutes": 5,
@@ -620,10 +651,35 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         imap["use_ssl"] = update.imap_use_ssl
     if update.delete_after_import is not None:
         cfg.setdefault("imap", {})["delete_after_import"] = update.delete_after_import
-    if update.gmail_use_label is not None:
-        cfg.setdefault("gmail", {})["use_label"] = update.gmail_use_label
-    if update.gmail_label is not None:
-        cfg.setdefault("gmail", {})["label"] = update.gmail_label
+    # Gmail accounts
+    if update.gmail_accounts is not None:
+        # Replace full list from UI (canonical).
+        cfg["gmail_accounts"] = [
+            {
+                "use_label": a.use_label,
+                "label": a.label,
+                "credentials_path": a.credentials_path,
+                "token_path": a.token_path,
+            }
+            for a in update.gmail_accounts
+        ]
+        # Do not keep legacy 'gmail' when explicitly using gmail_accounts.
+        if "gmail" in cfg:
+            cfg.pop("gmail", None)
+    else:
+        # Back-compat: UI may still send gmail_use_label/gmail_label for the first account.
+        if update.gmail_use_label is not None or update.gmail_label is not None:
+            existing = get_gmail_accounts(cfg)
+            if not existing:
+                existing = [{"credentials_path": "credentials.json", "token_path": "token.json"}]
+            first = dict(existing[0])
+            if update.gmail_use_label is not None:
+                first["use_label"] = update.gmail_use_label
+            if update.gmail_label is not None:
+                first["label"] = update.gmail_label
+            rest = existing[1:]
+            cfg["gmail_accounts"] = [first, *rest]
+            cfg.pop("gmail", None)
     if update.poll_interval_minutes is not None:
         cfg["poll_interval_minutes"] = update.poll_interval_minutes
     if update.state_db_path is not None:
@@ -631,6 +687,94 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     return {"status": "ok"}
+
+
+class DiscoveredToken(BaseModel):
+    token_path: str
+    email: str | None = None
+    in_use: bool = False
+
+
+@app.get("/api/gmail/discover-tokens", response_model=list[DiscoveredToken])
+def api_gmail_discover_tokens(request: Request) -> list[DiscoveredToken]:
+    """List token*.json files in config dir and (best-effort) associated Gmail email."""
+    if not _require_auth(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    cfg_dir = _config_dir_safe()
+    if not cfg_dir:
+        return []
+    # tokens in directory
+    token_files = sorted([p.name for p in Path(cfg_dir).glob("token*.json") if p.is_file()])
+    in_use: set[str] = set()
+    try:
+        if _config_exists():
+            cfg = load_config(_get_config_path(), resolve_password=False)
+            for a in get_gmail_accounts(cfg):
+                # Normalize for comparison against filenames in this directory. Config may store
+                # relative paths ("token2.json") or absolute paths ("/.../token2.json").
+                tp = Path(str(a.get("token_path", "token.json")))
+                in_use.add(tp.name)
+    except Exception:
+        pass
+    out: list[DiscoveredToken] = []
+    # Resolve email addresses best-effort (credentials required)
+    cred_path = Path(cfg_dir) / "credentials.json"
+    for fname in token_files:
+        tok_path = Path(cfg_dir) / fname
+        email = None
+        try:
+            if cred_path.exists() and tok_path.exists():
+                service = get_gmail_service(cred_path, tok_path)
+                profile = service.users().getProfile(userId="me").execute()
+                email = profile.get("emailAddress")
+        except Exception:
+            email = None
+        out.append(DiscoveredToken(token_path=fname, email=email, in_use=(fname in in_use)))
+    return out
+
+
+class DeleteGmailAccountBody(BaseModel):
+    index: int
+
+
+@app.delete("/api/gmail/accounts")
+def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> dict[str, str]:
+    """Delete a secondary Gmail account entry and delete its token file (safety: index must be > 0)."""
+    if not _require_auth(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if body.index <= 0:
+        raise HTTPException(status_code=400, detail="Cannot delete the primary Gmail account from the UI.")
+    path = _get_config_path()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="config.json not found")
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    accounts = get_gmail_accounts(cfg)
+    if body.index >= len(accounts):
+        raise HTTPException(status_code=400, detail="Invalid account index")
+    token_path = str(accounts[body.index].get("token_path", "")).strip()
+    # Remove from config
+    new_accounts = [accounts[i] for i in range(len(accounts)) if i != body.index]
+    cfg["gmail_accounts"] = new_accounts
+    cfg.pop("gmail", None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        # Delete token file (only if inside config dir and named token*.json)
+        cfg_dir = _config_dir()
+        tp = Path(token_path)
+        if not tp.is_absolute():
+            tp = cfg_dir / tp
+        tp = tp.resolve()
+        if tp.parent != cfg_dir.resolve():
+            return {"status": "ok", "message": "Account removed. Token file was not deleted (outside config dir)."}
+        if not tp.name.startswith("token") or not tp.name.endswith(".json"):
+            return {"status": "ok", "message": "Account removed. Token file was not deleted (unexpected filename)."}
+        if tp.exists():
+            tp.unlink()
+        return {"status": "ok", "message": f"Account removed. Deleted {tp.name}."}
+    except Exception:
+        return {"status": "ok", "message": "Account removed. Token file deletion failed (check permissions)."}
 
 
 class CopyAllBody(BaseModel):
@@ -692,9 +836,13 @@ def api_status(request: Request) -> dict[str, Any]:
         cfg = load_config(_get_config_path(), resolve_password=False)
         from .state import StateStore
         state_cfg = cfg.get("state", {})
-        db_path = state_cfg.get("db_path", "state.db")
+        raw_db_path = state_cfg.get("db_path", "state.db")
+        from pathlib import Path as _PathForStatus
+        db_path = _PathForStatus(raw_db_path)
+        if not db_path.is_absolute():
+            db_path = _PathForStatus(_get_config_path()).resolve().parent / db_path
         mailbox = (cfg.get("imap") or {}).get("mailbox", "INBOX")
-        state = StateStore(db_path)
+        state = StateStore(str(db_path))
         state.connect()
         row = state.get_last_fetch_time_any(mailbox)
         state.close()
@@ -800,7 +948,24 @@ _HTML_PAGE = """
     <h2>Gmail</h2>
     <p id="gmailStatus"></p>
     <p id="gmailEmail" class="status" style="font-size:0.9rem"></p>
-    <p class="hint" style="font-size:0.85rem; color:#666;">Token is from <code>fetch2gmail auth</code> (CLI). To switch accounts, run <code>fetch2gmail auth</code> again and replace token.json.</p>
+    <div id="gmailAccounts"></div>
+    <button type="button" id="btnAddGmailAccount">Add Gmail account</button>
+    <div id="addGmailAccountPanel" style="display:none; margin-top:0.75rem; padding:0.75rem; background:#f7f7f7; border:1px solid #e6e6e6;">
+      <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+        <label style="margin:0; flex: 1 1 320px;">
+          Token to add
+          <select id="addGmailTokenSelect" style="width:100%; padding:0.4rem; margin-top:0.25rem;"></select>
+        </label>
+        <div style="display:flex; gap:0.5rem; align-items:flex-end; padding-top:1.35rem;">
+          <button type="button" id="btnConfirmAddGmailAccount">Add</button>
+          <button type="button" id="btnCancelAddGmailAccount">Cancel</button>
+        </div>
+      </div>
+      <p id="addGmailAccountMsg" class="status" style="margin-top:0.5rem;"></p>
+    </div>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0.5rem;">
+      Tokens are created with <code>fetch2gmail auth</code> (CLI). To add a second account, run it again with a different token filename (e.g. <code>--token token2.json</code>).
+    </p>
   </section>
 
   <section id="changePasswordSection" style="display:none">
@@ -851,6 +1016,7 @@ _APP_JS = r"""
 (function() {
   const api = function(path) { return fetch(path).then(function(r) { if (r.status === 401) { location.href = '/'; throw new Error('Unauthorized'); } return r.ok ? r.json() : r.json().then(function(j) { return Promise.reject(j); }); }); };
   const put = function(path, body) { return fetch(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(function(r) { if (r.status === 401) { location.href = '/'; throw new Error('Unauthorized'); } return r.ok ? r.json() : r.json().then(function(j) { return Promise.reject(j); }); }); };
+  const del = function(path, body) { return fetch(path, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(function(r) { if (r.status === 401) { location.href = '/'; throw new Error('Unauthorized'); } return r.ok ? r.json() : r.json().then(function(j) { return Promise.reject(j); }); }); };
 
   fetch('/api/setup/status').then(function(r) { return r.json(); }).then(function(st) {
     if (!st.credentials_exist) {
@@ -869,6 +1035,55 @@ _APP_JS = r"""
   if (params.get('error') === 'no_credentials') document.getElementById('subtitle').innerHTML = '<span class="error">Put credentials.json in the app folder and run fetch2gmail auth for token.json.</span>';
 
   function hideLoading() { var el = document.getElementById('loadingMsg'); if (el) el.style.display = 'none'; }
+  function ensureGmailAccounts(c) {
+    if (c.gmail_accounts && c.gmail_accounts.length) return c.gmail_accounts;
+    // Back-compat: synthesize from single c.gmail
+    if (c.gmail) return [c.gmail];
+    return [];
+  }
+  function renderGmailAccounts(c) {
+    var wrap = document.getElementById('gmailAccounts');
+    if (!wrap) return;
+    var accounts = ensureGmailAccounts(c);
+    if (!accounts.length) {
+      wrap.innerHTML = '<p class="error">No Gmail accounts configured.</p>';
+      return;
+    }
+    var html = '<div style="margin-top:0.5rem;">';
+    html += '<table style="width:100%; border-collapse:collapse;">';
+    html += '<tr><th style="text-align:left; font-weight:600; padding:4px 0;">Account</th><th style="text-align:left; font-weight:600; padding:4px 0;">Token</th><th style="text-align:left; font-weight:600; padding:4px 0;">Label</th><th></th></tr>';
+    for (var i = 0; i < accounts.length; i++) {
+      var a = accounts[i];
+      var token = (a.token_path || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      var label = (a.label || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      html += '<tr style="border-top:1px solid #eee;">';
+      html += '<td style="padding:6px 0;">#' + (i + 1) + (i === 0 ? ' (primary)' : '') + '</td>';
+      html += '<td style="padding:6px 0;"><code>' + token + '</code></td>';
+      html += '<td style="padding:6px 0;"><input type="text" data-glabel="' + i + '" value="' + label + '" style="width: 95%;"></td>';
+      html += '<td style="padding:6px 0; text-align:right;">' + (i === 0 ? '' : '<button type="button" data-gdel="' + i + '">Delete</button>') + '</td>';
+      html += '</tr>';
+    }
+    html += '</table>';
+    html += '<p class="hint" style="font-size:0.85rem; color:#666; margin:0.5rem 0 0;">Deleting a secondary account also deletes its token file (e.g. <code>token2.json</code>).</p>';
+    html += '</div>';
+    wrap.innerHTML = html;
+    // Wire delete buttons
+    var btns = wrap.querySelectorAll('button[data-gdel]');
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].onclick = function(ev) {
+        var idx = parseInt(ev.target.getAttribute('data-gdel'), 10);
+        if (!confirm('Delete Gmail account #' + (idx + 1) + '?\\n\\nThis will remove it from config and delete its token file.')) return;
+        del('/api/gmail/accounts', { index: idx }).then(function(r) {
+          document.getElementById('status').textContent = r.message || 'Account deleted.';
+          document.getElementById('status').className = 'status';
+          return loadConfig().then(function(cc) { if (cc) { renderGmailAccounts(cc); } });
+        }).catch(function(e) {
+          document.getElementById('status').textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Delete failed');
+          document.getElementById('status').className = 'error';
+        });
+      };
+    }
+  }
   function loadConfig() {
     return api('/api/config').then(function(c) {
       hideLoading();
@@ -905,6 +1120,7 @@ _APP_JS = r"""
       if (c.gmail_connected) {
         api('/api/gmail/email').then(function(d) { if (d.email) document.getElementById('gmailEmail').textContent = 'Connected as ' + d.email; }).catch(function() {});
       }
+      renderGmailAccounts(c);
       return c;
     }).catch(function(e) {
       hideLoading();
@@ -1052,7 +1268,22 @@ _APP_JS = r"""
   document.getElementById('gmail_use_label').onchange = function() {
     document.getElementById('gmail_label_row').style.display = this.checked ? 'block' : 'none';
   };
+  // Keep legacy "Label name" and table row 0 in sync (table is source of truth on save).
+  document.getElementById('gmail_label').addEventListener('input', function() {
+    var first = document.querySelector('#gmailAccounts input[data-glabel="0"]');
+    if (first) first.value = this.value;
+  });
+  document.getElementById('gmailAccounts').addEventListener('input', function(ev) {
+    var el = ev.target;
+    if (el.getAttribute('data-glabel') === '0') document.getElementById('gmail_label').value = el.value;
+  });
   document.getElementById('btnSave').onclick = function() {
+    // Read current accounts from UI (labels only editable here).
+    var currentAccounts = null;
+    try {
+      // use last loaded config from DOM if present
+      // We'll rebuild from /api/config right before save to avoid stale token list
+    } catch (e) {}
     var body = {
       imap_host: document.getElementById('imap_host').value,
       imap_port: parseInt(document.getElementById('imap_port').value, 10),
@@ -1067,7 +1298,22 @@ _APP_JS = r"""
     };
     var pw = document.getElementById('imap_password').value;
     if (pw) body.imap_password = pw;
-    put('/api/config', body).then(function() {
+    // Merge updated labels into gmail_accounts and save canonical list.
+    api('/api/config').then(function(c) {
+      var accounts = ensureGmailAccounts(c);
+      var labelInputs = document.querySelectorAll('#gmailAccounts input[data-glabel]');
+      for (var i = 0; i < labelInputs.length; i++) {
+        var idx = parseInt(labelInputs[i].getAttribute('data-glabel'), 10);
+        if (accounts[idx]) accounts[idx].label = labelInputs[i].value;
+      }
+      // Table is single source of truth (legacy field is synced into table row 0 via listener below).
+      // also apply global label toggle to all accounts (simple, predictable)
+      for (var k = 0; k < accounts.length; k++) {
+        accounts[k].use_label = document.getElementById('gmail_use_label').checked;
+      }
+      body.gmail_accounts = accounts;
+      return put('/api/config', body);
+    }).then(function() {
       document.getElementById('status').textContent = 'Config saved.';
       document.getElementById('status').className = 'status';
       if (pw) document.getElementById('imap_password').value = '';
@@ -1107,6 +1353,80 @@ _APP_JS = r"""
       msg.className = 'error';
     });
   };
+
+  var addBtn = document.getElementById('btnAddGmailAccount');
+  if (addBtn) {
+    addBtn.onclick = function() {
+      var panel = document.getElementById('addGmailAccountPanel');
+      var sel = document.getElementById('addGmailTokenSelect');
+      var msg = document.getElementById('addGmailAccountMsg');
+      var btnOk = document.getElementById('btnConfirmAddGmailAccount');
+      var btnCancel = document.getElementById('btnCancelAddGmailAccount');
+      if (!panel || !sel || !msg || !btnOk || !btnCancel) return;
+      msg.textContent = 'Loading tokens...';
+      msg.className = 'status';
+      panel.style.display = 'block';
+      sel.innerHTML = '';
+      btnOk.disabled = true;
+
+      function closePanel() {
+        panel.style.display = 'none';
+        msg.textContent = '';
+        sel.innerHTML = '';
+      }
+      btnCancel.onclick = closePanel;
+
+      api('/api/gmail/discover-tokens').then(function(tokens) {
+        var available = tokens.filter(function(t) { return !t.in_use && t.token_path; });
+        if (!available.length) {
+          msg.textContent = 'No unused token*.json files found in the app folder. Run: fetch2gmail auth --token token2.json';
+          msg.className = 'error';
+          btnOk.disabled = true;
+          return;
+        }
+        for (var i = 0; i < available.length; i++) {
+          var t = available[i];
+          var opt = document.createElement('option');
+          opt.value = t.token_path;
+          opt.textContent = t.token_path + (t.email ? (' (' + t.email + ')') : '');
+          sel.appendChild(opt);
+        }
+        msg.textContent = 'Select a token and click Add.';
+        msg.className = 'status';
+        btnOk.disabled = false;
+
+        btnOk.onclick = function() {
+          var chosen = sel.value;
+          if (!chosen) return;
+          btnOk.disabled = true;
+          msg.textContent = 'Adding account...';
+          msg.className = 'status';
+          api('/api/config').then(function(c) {
+            var accounts = ensureGmailAccounts(c);
+            accounts.push({
+              use_label: document.getElementById('gmail_use_label').checked,
+              label: document.getElementById('gmail_label').value || 'ISP Mail',
+              credentials_path: (accounts[0] && accounts[0].credentials_path) ? accounts[0].credentials_path : 'credentials.json',
+              token_path: chosen
+            });
+            return put('/api/config', { gmail_accounts: accounts });
+          }).then(function() {
+            msg.textContent = 'Account added.';
+            msg.className = 'ok';
+            setTimeout(function() { closePanel(); loadConfig(); }, 600);
+          }).catch(function(e) {
+            msg.textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Failed');
+            msg.className = 'error';
+            btnOk.disabled = false;
+          });
+        };
+      }).catch(function() {
+        msg.textContent = 'Could not discover tokens.';
+        msg.className = 'error';
+        btnOk.disabled = true;
+      });
+    };
+  }
 })();
 """
 
