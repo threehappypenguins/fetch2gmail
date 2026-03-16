@@ -8,6 +8,7 @@ state.db
 credentials.json
 token.json
 *.pem
+.cursor
 
 # Python
 __pycache__/
