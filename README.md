@@ -206,11 +206,18 @@ One instance = one IMAP mailbox → one Gmail account. To run **multiple account
    ```bash
    fetch2gmail install-service --user YOUR_USER --dir /opt/fetch2gmail2 -o /tmp/fetch2gmail2.service
    ```
-   Edit `/tmp/fetch2gmail2.service`: in **ExecStart**, add **`--port 8766`** so this instance uses port 8766 (the first stays on 8765). Set **WorkingDirectory** and **Environment=FETCH2GMAIL_CONFIG** to the second directory (e.g. `/opt/fetch2gmail2`, `/opt/fetch2gmail2/config.json`).
 
-3. Install and enable the second unit under a different name so both can run:
+3. Install the second unit under a different name so both can run, **then edit its ExecStart to add a port**:
    ```bash
    sudo mv /tmp/fetch2gmail2.service /etc/systemd/system/fetch2gmail2.service
+   sudo nano /etc/systemd/system/fetch2gmail2.service
+   ```
+   In the editor, find the `ExecStart=` line and make sure it includes a port flag, for example:
+   ```
+   ExecStart=/home/YOUR_USER/.local/pipx/venvs/fetch2gmail/bin/fetch2gmail serve --host 0.0.0.0 --port 8766
+   ```
+   Also set **WorkingDirectory** and **Environment=FETCH2GMAIL_CONFIG** to the second directory (e.g. `/opt/fetch2gmail2`, `/opt/fetch2gmail2/config.json`). Then reload and enable:
+   ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable fetch2gmail2
    sudo systemctl start fetch2gmail2
