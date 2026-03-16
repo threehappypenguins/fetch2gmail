@@ -235,7 +235,21 @@ def _cmd_auth(args: argparse.Namespace) -> None:
     from .auth_server import app
 
     cred_path = Path(args.credentials).resolve()
-    token_path = Path(args.token).resolve()
+    # If the user did not override --token (still default "token.json"), automatically pick
+    # token.json, token2.json, token3.json, ... in the current directory, so additional
+    # accounts are easy to add without manually specifying --token.
+    if args.token == "token.json":
+        base_dir = Path.cwd()
+        idx = 0
+        while True:
+            name = "token.json" if idx == 0 else f"token{idx + 1}.json"
+            candidate = base_dir / name
+            if not candidate.exists():
+                token_path = candidate
+                break
+            idx += 1
+    else:
+        token_path = Path(args.token).resolve()
     if not cred_path.exists():
         print(f"Credentials file not found: {cred_path}", file=sys.stderr)
         print("Download credentials.json from Google Cloud (OAuth client, Web application).", file=sys.stderr)
@@ -252,8 +266,9 @@ def _cmd_auth(args: argparse.Namespace) -> None:
         webbrowser.open(url)
 
     threading.Thread(target=open_browser, daemon=True).start()
-    print(f"Opening {url} in your browser. Sign in with Google; token will be saved to {token_path}")
-    print("Then copy credentials.json and token.json to your Odroid. Press Ctrl+C when done.")
+    token_name = token_path.name
+    print(f"Opening {url} in your browser. Sign in with Google; {token_name} will be saved to {token_path}")
+    print(f"Then copy credentials.json and {token_name} to your Odroid. Press Ctrl+C when done.")
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 

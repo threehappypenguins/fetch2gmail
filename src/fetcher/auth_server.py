@@ -97,12 +97,13 @@ def _auth_callback(
 
     cred_abs = cred_path.resolve()
     tok_abs = token_path.resolve()
+    tok_name = tok_abs.name
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Token saved</title></head><body>
     <h2>Token saved</h2>
-    <p><strong>token.json</strong> has been saved. Copy these two files to your Odroid (or other headless device):</p>
+    <p><strong>{tok_name}</strong> has been saved. Copy these two files to your Odroid (or other headless device):</p>
     <ul>
       <li><strong>credentials.json</strong> (from GCP)</li>
-      <li><strong>token.json</strong> (just saved at <code>{tok_abs}</code>)</li>
+      <li><strong>{tok_name}</strong> (just saved at <code>{tok_abs}</code>)</li>
     </ul>
     <p>On the headless server (e.g. Debian, Odroid, Raspberry Pi), put both files in the <strong>data directory</strong> where Fetch2Gmail runs — the same folder as <code>config.json</code>, e.g. <code>/opt/fetch2gmail</code> or <code>/home/odroid/fetch2gmail</code>. See the README for setup.</p>
     <p>You can close this window and stop the server (Ctrl+C).</p>

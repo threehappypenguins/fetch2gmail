@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fetch2gmail"
-version = "1.1.6"
+version = "1.1.7"
 description = "Self-hosted email fetcher: IMAP to Gmail API import with idempotent state tracking"
 readme = "README.md"
 license = "MIT"

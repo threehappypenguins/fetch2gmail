@@ -1046,43 +1046,88 @@ _APP_JS = r"""
     if (!wrap) return;
     var accounts = ensureGmailAccounts(c);
     if (!accounts.length) {
-      wrap.innerHTML = '<p class="error">No Gmail accounts configured.</p>';
+      wrap.innerHTML = '<p class=\"error\">No Gmail accounts configured.</p>';
       return;
     }
-    var html = '<div style="margin-top:0.5rem;">';
-    html += '<table style="width:100%; border-collapse:collapse;">';
-    html += '<tr><th style="text-align:left; font-weight:600; padding:4px 0;">Account</th><th style="text-align:left; font-weight:600; padding:4px 0;">Token</th><th style="text-align:left; font-weight:600; padding:4px 0;">Label</th><th></th></tr>';
-    for (var i = 0; i < accounts.length; i++) {
-      var a = accounts[i];
-      var token = (a.token_path || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      var label = (a.label || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      html += '<tr style="border-top:1px solid #eee;">';
-      html += '<td style="padding:6px 0;">#' + (i + 1) + (i === 0 ? ' (primary)' : '') + '</td>';
-      html += '<td style="padding:6px 0;"><code>' + token + '</code></td>';
-      html += '<td style="padding:6px 0;"><input type="text" data-glabel="' + i + '" value="' + label + '" style="width: 95%;"></td>';
-      html += '<td style="padding:6px 0; text-align:right;">' + (i === 0 ? '' : '<button type="button" data-gdel="' + i + '">Delete</button>') + '</td>';
-      html += '</tr>';
-    }
-    html += '</table>';
-    html += '<p class="hint" style="font-size:0.85rem; color:#666; margin:0.5rem 0 0;">Deleting a secondary account also deletes its token file (e.g. <code>token2.json</code>).</p>';
-    html += '</div>';
-    wrap.innerHTML = html;
-    // Wire delete buttons
-    var btns = wrap.querySelectorAll('button[data-gdel]');
-    for (var j = 0; j < btns.length; j++) {
-      btns[j].onclick = function(ev) {
-        var idx = parseInt(ev.target.getAttribute('data-gdel'), 10);
-        if (!confirm('Delete Gmail account #' + (idx + 1) + '?\\n\\nThis will remove it from config and delete its token file.')) return;
-        del('/api/gmail/accounts', { index: idx }).then(function(r) {
-          document.getElementById('status').textContent = r.message || 'Account deleted.';
-          document.getElementById('status').className = 'status';
-          return loadConfig().then(function(cc) { if (cc) { renderGmailAccounts(cc); } });
-        }).catch(function(e) {
-          document.getElementById('status').textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Delete failed');
-          document.getElementById('status').className = 'error';
-        });
-      };
-    }
+    // Enrich with Gmail email addresses by looking at token*.json files.
+    api('/api/gmail/discover-tokens').then(function(tokens) {
+      var emailByToken = {};
+      if (Array.isArray(tokens)) {
+        for (var i = 0; i < tokens.length; i++) {
+          var t = tokens[i];
+          if (t && t.token_path) emailByToken[t.token_path] = t.email || '';
+        }
+      }
+      var html = '<div style=\"margin-top:0.5rem;\">';
+      html += '<table style=\"width:100%; border-collapse:collapse;\">';
+      html += '<tr><th style=\"text-align:left; font-weight:600; padding:4px 0;\">Account</th><th style=\"text-align:left; font-weight:600; padding:4px 0;\">Token</th><th style=\"text-align:left; font-weight:600; padding:4px 0;\">Gmail account</th><th></th></tr>';
+      for (var j = 0; j < accounts.length; j++) {
+        var a = accounts[j];
+        var token = (a.token_path || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        var email = emailByToken[a.token_path || ''] || '';
+        var emailDisplay = email ? email.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '(unknown)';
+        html += '<tr style=\"border-top:1px solid #eee;\">';
+        html += '<td style=\"padding:6px 0;\">#' + (j + 1) + (j === 0 ? ' (primary)' : '') + '</td>';
+        html += '<td style=\"padding:6px 0;\"><code>' + token + '</code></td>';
+        html += '<td style=\"padding:6px 0; white-space:nowrap;\">' + emailDisplay + '</td>';
+        html += '<td style=\"padding:6px 0; text-align:right;\">' + (j === 0 ? '' : '<button type=\"button\" data-gdel=\"' + j + '\">Delete</button>') + '</td>';
+        html += '</tr>';
+      }
+      html += '</table>';
+      html += '<p class=\"hint\" style=\"font-size:0.85rem; color:#666; margin:0.5rem 0 0;\">Deleting a secondary account also deletes its token file (e.g. <code>token2.json</code>).</p>';
+      html += '</div>';
+      wrap.innerHTML = html;
+      // Wire delete buttons
+      var btns = wrap.querySelectorAll('button[data-gdel]');
+      for (var k = 0; k < btns.length; k++) {
+        btns[k].onclick = function(ev) {
+          var idx = parseInt(ev.target.getAttribute('data-gdel'), 10);
+          if (!confirm('Delete Gmail account #' + (idx + 1) + '?\\n\\nThis will remove it from config and delete its token file.')) return;
+          del('/api/gmail/accounts', { index: idx }).then(function(r) {
+            document.getElementById('status').textContent = r.message || 'Account deleted.';
+            document.getElementById('status').className = 'status';
+            return loadConfig().then(function(cc) { if (cc) { renderGmailAccounts(cc); } });
+          }).catch(function(e) {
+            document.getElementById('status').textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Delete failed');
+            document.getElementById('status').className = 'error';
+          });
+        };
+      }
+    }).catch(function() {
+      // Fallback: render without email info if discover-tokens fails.
+      var html = '<div style=\"margin-top:0.5rem;\">';
+      html += '<table style=\"width:100%; border-collapse:collapse;\">';
+      html += '<tr><th style=\"text-align:left; font-weight:600; padding:4px 0;\">Account</th><th style=\"text-align:left; font-weight:600; padding:4px 0;\">Token</th><th></th></tr>';
+      for (var j = 0; j < accounts.length; j++) {
+        var a = accounts[j];
+        var token = (a.token_path || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        html += '<tr style=\"border-top:1px solid #eee;\">';
+        html += '<td style=\"padding:6px 0;\">#' + (j + 1) + (j === 0 ? ' (primary)' : '') + '</td>';
+        html += '<td style=\"padding:6px 0;\"><code>' + token + '</code></td>';
+        html += '<td style=\"padding:6px 0; text-align:right;\">' + (j === 0 ? '' : '<button type=\"button\" data-gdel=\"' + j + '\">Delete</button>') + '</td>';
+        html += '</tr>';
+      }
+      html += '</table>';
+      html += '<p class=\"hint\" style=\"font-size:0.85rem; color:#666; margin:0.5rem 0 0;\">Deleting a secondary account also deletes its token file (e.g. <code>token2.json</code>).</p>';
+      html += '</div>';
+      wrap.innerHTML = html;
+      // Wire delete buttons in fallback as well.
+      var btns = wrap.querySelectorAll('button[data-gdel]');
+      for (var k = 0; k < btns.length; k++) {
+        btns[k].onclick = function(ev) {
+          var idx = parseInt(ev.target.getAttribute('data-gdel'), 10);
+          if (!confirm('Delete Gmail account #' + (idx + 1) + '?\\n\\nThis will remove it from config and delete its token file.')) return;
+          del('/api/gmail/accounts', { index: idx }).then(function(r) {
+            document.getElementById('status').textContent = r.message || 'Account deleted.';
+            document.getElementById('status').className = 'status';
+            return loadConfig().then(function(cc) { if (cc) { renderGmailAccounts(cc); } });
+          }).catch(function(e) {
+            document.getElementById('status').textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Delete failed');
+            document.getElementById('status').className = 'error';
+          });
+        };
+      }
+    });
   }
   function loadConfig() {
     return api('/api/config').then(function(c) {
@@ -1118,7 +1163,21 @@ _APP_JS = r"""
       document.getElementById('gmailStatus').innerHTML = c.gmail_connected ? '<span class="ok">Gmail connected</span>' : '<span class="error">Not connected (add token.json from fetch2gmail auth)</span>';
       document.getElementById('gmailEmail').textContent = '';
       if (c.gmail_connected) {
-        api('/api/gmail/email').then(function(d) { if (d.email) document.getElementById('gmailEmail').textContent = 'Connected as ' + d.email; }).catch(function() {});
+        api('/api/gmail/discover-tokens').then(function(tokens) {
+          if (!Array.isArray(tokens) || !tokens.length) return;
+          var emails = [];
+          for (var i = 0; i < tokens.length; i++) {
+            if (tokens[i].email) emails.push(tokens[i].email);
+          }
+          if (!emails.length) return;
+          var uniq = [];
+          var seen = {};
+          for (var j = 0; j < emails.length; j++) {
+            var e = emails[j];
+            if (!seen[e]) { seen[e] = true; uniq.push(e); }
+          }
+          document.getElementById('gmailEmail').textContent = 'Connected as ' + uniq.join(', ');
+        }).catch(function() {});
       }
       renderGmailAccounts(c);
       return c;
@@ -1268,15 +1327,6 @@ _APP_JS = r"""
   document.getElementById('gmail_use_label').onchange = function() {
     document.getElementById('gmail_label_row').style.display = this.checked ? 'block' : 'none';
   };
-  // Keep legacy "Label name" and table row 0 in sync (table is source of truth on save).
-  document.getElementById('gmail_label').addEventListener('input', function() {
-    var first = document.querySelector('#gmailAccounts input[data-glabel="0"]');
-    if (first) first.value = this.value;
-  });
-  document.getElementById('gmailAccounts').addEventListener('input', function(ev) {
-    var el = ev.target;
-    if (el.getAttribute('data-glabel') === '0') document.getElementById('gmail_label').value = el.value;
-  });
   document.getElementById('btnSave').onclick = function() {
     // Read current accounts from UI (labels only editable here).
     var currentAccounts = null;
@@ -1298,18 +1348,18 @@ _APP_JS = r"""
     };
     var pw = document.getElementById('imap_password').value;
     if (pw) body.imap_password = pw;
-    // Merge updated labels into gmail_accounts and save canonical list.
+    // Merge updated settings into gmail_accounts and save canonical list.
     api('/api/config').then(function(c) {
       var accounts = ensureGmailAccounts(c);
-      var labelInputs = document.querySelectorAll('#gmailAccounts input[data-glabel]');
-      for (var i = 0; i < labelInputs.length; i++) {
-        var idx = parseInt(labelInputs[i].getAttribute('data-glabel'), 10);
-        if (accounts[idx]) accounts[idx].label = labelInputs[i].value;
-      }
-      // Table is single source of truth (legacy field is synced into table row 0 via listener below).
-      // also apply global label toggle to all accounts (simple, predictable)
+      var useLabel = document.getElementById('gmail_use_label').checked;
+      var globalLabel = document.getElementById('gmail_label').value || 'ISP Mail';
+      // Apply global label toggle to all accounts; apply global label NAME only to primary
+      // account so per-account labels (e.g. email-based) are not overwritten.
       for (var k = 0; k < accounts.length; k++) {
-        accounts[k].use_label = document.getElementById('gmail_use_label').checked;
+        accounts[k].use_label = useLabel;
+        if (k === 0) {
+          accounts[k].label = globalLabel;
+        }
       }
       body.gmail_accounts = accounts;
       return put('/api/config', body);
@@ -1376,7 +1426,7 @@ _APP_JS = r"""
       }
       btnCancel.onclick = closePanel;
 
-      api('/api/gmail/discover-tokens').then(function(tokens) {
+          api('/api/gmail/discover-tokens').then(function(tokens) {
         var available = tokens.filter(function(t) { return !t.in_use && t.token_path; });
         if (!available.length) {
           msg.textContent = 'No unused token*.json files found in the app folder. Run: fetch2gmail auth --token token2.json';
@@ -1401,11 +1451,16 @@ _APP_JS = r"""
           btnOk.disabled = true;
           msg.textContent = 'Adding account...';
           msg.className = 'status';
+          var chosenEmail = '';
+          for (var i = 0; i < available.length; i++) {
+            if (available[i].token_path === chosen) { chosenEmail = available[i].email || ''; break; }
+          }
           api('/api/config').then(function(c) {
             var accounts = ensureGmailAccounts(c);
             accounts.push({
               use_label: document.getElementById('gmail_use_label').checked,
-              label: document.getElementById('gmail_label').value || 'ISP Mail',
+              // Default label for new accounts: Gmail email if known; otherwise fall back to global label or ISP Mail.
+              label: (chosenEmail || document.getElementById('gmail_label').value || 'ISP Mail'),
               credentials_path: (accounts[0] && accounts[0].credentials_path) ? accounts[0].credentials_path : 'credentials.json',
               token_path: chosen
             });
