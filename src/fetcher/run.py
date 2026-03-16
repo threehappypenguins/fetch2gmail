@@ -58,6 +58,9 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
     db_path = state_cfg.get("db_path", "state.db")
     mailbox = imap_cfg.get("mailbox", "INBOX")
     delete_after_import = imap_cfg.get("delete_after_import", True)
+    since_date = imap_cfg.get("since_date")
+    if since_date == "":
+        since_date = None
     use_label = gmail_cfg.get("use_label") if "use_label" in gmail_cfg else bool((gmail_cfg.get("label") or "").strip())
     label_name = (gmail_cfg.get("label") or "ISP Mail").strip() if use_label else None
 
@@ -87,6 +90,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
             mailbox=mailbox,
             use_ssl=imap_cfg.get("use_ssl", True),
             last_processed_uid=last_uid,
+            since=since_date,
         )
     except Exception as e:
         logger.exception("IMAP fetch failed: %s", e)
@@ -99,21 +103,6 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
     label_id = None
     inbox_label_id = None
     unread_label_id = None
-
-    if not dry_run:
-        try:
-            service = get_gmail_service(
-                gmail_cfg["credentials_path"],
-                gmail_cfg["token_path"],
-            )
-            inbox_label_id = get_inbox_label_id(service, USER_ID)
-            unread_label_id = get_unread_label_id(service, USER_ID)
-            label_id = _ensure_label(service, label_name) if label_name else None
-            if label_name and not label_id:
-                label_id = _ensure_label(service, label_name)
-        except Exception as e:
-            logger.exception("Gmail API init failed: %s", e)
-            return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     for msg in messages_iter:
         if state.seen_hash(msg.message_hash):
@@ -152,6 +141,21 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
             logger.info("[DRY-RUN] Would import uid=%s (hash=%s)", msg.uid, msg.message_hash[:16])
             imported += 1
             continue
+
+        if not service:
+            try:
+                service = get_gmail_service(
+                    gmail_cfg["credentials_path"],
+                    gmail_cfg["token_path"],
+                )
+                inbox_label_id = get_inbox_label_id(service, USER_ID)
+                unread_label_id = get_unread_label_id(service, USER_ID)
+                label_id = _ensure_label(service, label_name) if label_name else None
+                if label_name and not label_id:
+                    label_id = _ensure_label(service, label_name)
+            except Exception as e:
+                logger.exception("Gmail API init failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
         try:
             label_ids = [label_id] if label_id else []
@@ -226,6 +230,9 @@ def run_copy_all(
     state_cfg = cfg.get("state", {})
     db_path = state_cfg.get("db_path", "state.db")
     mailbox = imap_cfg.get("mailbox", "INBOX")
+    since_date = imap_cfg.get("since_date")
+    if since_date == "":
+        since_date = None
     use_label = gmail_cfg.get("use_label") if "use_label" in gmail_cfg else bool((gmail_cfg.get("label") or "").strip())
     label_name = (gmail_cfg.get("label") or "ISP Mail").strip() if use_label else None
 
@@ -254,6 +261,7 @@ def run_copy_all(
             mailbox=mailbox,
             use_ssl=imap_cfg.get("use_ssl", True),
             last_processed_uid=None,
+            since=since_date,
         )
     except Exception as e:
         logger.exception("IMAP fetch failed: %s", e)
@@ -266,19 +274,6 @@ def run_copy_all(
     label_id = None
     inbox_label_id = None
     unread_label_id = None
-
-    if not dry_run:
-        try:
-            service = get_gmail_service(
-                gmail_cfg["credentials_path"],
-                gmail_cfg["token_path"],
-            )
-            inbox_label_id = get_inbox_label_id(service, USER_ID)
-            unread_label_id = get_unread_label_id(service, USER_ID)
-            label_id = _ensure_label(service, label_name) if label_name else None
-        except Exception as e:
-            logger.exception("Gmail API init failed: %s", e)
-            return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     for msg in messages_iter:
         if state.seen_hash(msg.message_hash):
@@ -301,37 +296,6 @@ def run_copy_all(
                     logger.warning("Delete (duplicate) failed for uid=%s: %s", msg.uid, e)
             continue
 
-        if not dry_run:
-            message_id_header = _parse_message_id_from_raw(msg.raw)
-            if message_id_header and gmail_has_message_with_id(
-                service, USER_ID, message_id_header
-            ):
-                logger.debug(
-                    "Copy-all: skipping (already in Gmail by Message-ID): uid=%s",
-                    msg.uid,
-                )
-                skipped_duplicate += 1
-                if delete_after_import:
-                    try:
-                        delete_and_expunge(
-                            imap_cfg["host"],
-                            int(imap_cfg.get("port", 993)),
-                            imap_cfg["username"],
-                            imap_cfg["password"],
-                            mailbox,
-                            msg.uid,
-                            imap_cfg.get("use_ssl", True),
-                        )
-                        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-                        deleted += 1
-                    except Exception as e:
-                        logger.warning(
-                            "Delete (already in Gmail) failed for uid=%s: %s",
-                            msg.uid,
-                            e,
-                        )
-                continue
-
         if dry_run:
             logger.info(
                 "[DRY-RUN] Copy-all would import uid=%s (hash=%s)",
@@ -339,6 +303,49 @@ def run_copy_all(
                 msg.message_hash[:16],
             )
             imported += 1
+            continue
+
+        if not service:
+            try:
+                service = get_gmail_service(
+                    gmail_cfg["credentials_path"],
+                    gmail_cfg["token_path"],
+                )
+                inbox_label_id = get_inbox_label_id(service, USER_ID)
+                unread_label_id = get_unread_label_id(service, USER_ID)
+                label_id = _ensure_label(service, label_name) if label_name else None
+            except Exception as e:
+                logger.exception("Gmail API init failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
+
+        message_id_header = _parse_message_id_from_raw(msg.raw)
+        if message_id_header and gmail_has_message_with_id(
+            service, USER_ID, message_id_header
+        ):
+            logger.debug(
+                "Copy-all: skipping (already in Gmail by Message-ID): uid=%s",
+                msg.uid,
+            )
+            skipped_duplicate += 1
+            if delete_after_import:
+                try:
+                    delete_and_expunge(
+                        imap_cfg["host"],
+                        int(imap_cfg.get("port", 993)),
+                        imap_cfg["username"],
+                        imap_cfg["password"],
+                        mailbox,
+                        msg.uid,
+                        imap_cfg.get("use_ssl", True),
+                    )
+                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(
+                        "Delete (already in Gmail) failed for uid=%s: %s",
+                        msg.uid,
+                        e,
+                    )
             continue
 
         try:
