@@ -92,6 +92,9 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
     delete_after_import = imap_cfg.get("delete_after_import", True)
+    since_date = imap_cfg.get("since_date")
+    if since_date == "":
+        since_date = None
 
     state = StateStore(str(db_path))
     state.connect()
@@ -119,6 +122,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
             mailbox=mailbox,
             use_ssl=imap_cfg.get("use_ssl", True),
             last_processed_uid=last_uid,
+            since=since_date,
         )
     except Exception as e:
         logger.exception("IMAP fetch failed: %s", e)
@@ -128,13 +132,6 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
     skipped_duplicate = 0
     deleted = 0
     gmail_contexts: list[tuple[Any, str | None, str, str]] = []
-
-    if not dry_run:
-        try:
-            gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
-        except Exception as e:
-            logger.exception("Gmail API init failed: %s", e)
-            return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     for msg in messages_iter:
         if state.seen_hash(msg.message_hash):
@@ -161,6 +158,13 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
             logger.info("[DRY-RUN] Would import uid=%s (hash=%s)", msg.uid, msg.message_hash[:16])
             imported += 1
             continue
+
+        if not gmail_contexts:
+            try:
+                gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+            except Exception as e:
+                logger.exception("Gmail API init failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
         # Import to all Gmail accounts. Record state when at least one import succeeds; only
         # delete from ISP when *all* imports succeed. This avoids duplicate imports when a
@@ -266,6 +270,9 @@ def run_copy_all(
     if not db_path.is_absolute():
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
+    since_date = imap_cfg.get("since_date")
+    if since_date == "":
+        since_date = None
 
     state = StateStore(str(db_path))
     state.connect()
@@ -292,6 +299,7 @@ def run_copy_all(
             mailbox=mailbox,
             use_ssl=imap_cfg.get("use_ssl", True),
             last_processed_uid=None,
+            since=since_date,
         )
     except Exception as e:
         logger.exception("IMAP fetch failed: %s", e)
@@ -301,13 +309,6 @@ def run_copy_all(
     skipped_duplicate = 0
     deleted = 0
     gmail_contexts: list[tuple[Any, str | None, str, str]] = []
-
-    if not dry_run:
-        try:
-            gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
-        except Exception as e:
-            logger.exception("Gmail API init failed: %s", e)
-            return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     for msg in messages_iter:
         # Copy-all is also used as a "repair" tool. With multiple Gmail accounts, we must not
@@ -346,9 +347,14 @@ def run_copy_all(
             imported += 1
             continue
 
-        message_id_header = None
-        if not dry_run:
-            message_id_header = _parse_message_id_from_raw(msg.raw)
+        if not gmail_contexts:
+            try:
+                gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+            except Exception as e:
+                logger.exception("Gmail API init failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
+
+        message_id_header = _parse_message_id_from_raw(msg.raw)
 
         first_gmail_id: str | None = None
         all_succeeded = True
