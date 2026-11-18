@@ -2,8 +2,8 @@
 
 Self-hosted email fetcher: **IMAP (ISP mailbox) → Gmail API import**. Replaces Gmail’s deprecated POP3 fetch.
 
-- Polls an ISP mailbox via **IMAPS** (port 993).
-- Imports messages with **Gmail API** (not SMTP); applies a Gmail label, preserves headers and date.
+- Watches an ISP mailbox via **IMAPS** (port 993), using **IMAP IDLE** for near-realtime delivery when the server supports it (falls back to polling otherwise).
+- Imports messages with **Gmail API** (not SMTP); applies a Gmail label, preserves headers and date. By default uses **`neverMarkSpam`** so Gmail’s spam classifier does not bury ISP→Gmail imports.
 - Deletes from ISP only after Gmail confirms import. **Idempotent** (UID + message hash).
 
 **Requirements:** Python 3.11+, IMAP credentials, Google Cloud project with Gmail API and OAuth2 (Web application).
@@ -180,9 +180,17 @@ Your Google OAuth client must use **Web application** (not Desktop) and have the
 
 Google does not allow redirect URIs that use an IP address. That is why the token must be obtained on a machine where the app can use localhost (Use case 1 steps 1–4 on a PC; Use case 2 on the same machine).
 
-### Poll interval
+### IMAP IDLE and poll interval
 
-The app runs the fetch every 5 minutes by default (background poller in the same process as the web UI). You can change the interval in the web UI (Config) or in **config.json** (`poll_interval_minutes`).
+The background watcher in the web UI process prefers **IMAP IDLE** (RFC 2177) when the server advertises the `IDLE` capability. New mail can trigger an import immediately instead of waiting for the next poll.
+
+- **`imap.use_idle`** (default `true`): enable IDLE when supported. Disable to force polling.
+- **`imap.idle_refresh_minutes`** (default `25`): leave IDLE, send `NOOP`, and re-enter IDLE before the typical ~29-minute server timeout. Also enables TCP `SO_KEEPALIVE` and reconnects with exponential backoff on silent drops.
+- **`poll_interval_minutes`** (default `5`): used when IDLE is missing or disabled.
+
+All three can be changed in the web UI (Config) or in **config.json**.
+
+**Manual smoke checks:** with IDLE supported, send yourself mail and confirm an import in the UI logs within seconds (look for `IDLE: mailbox update`). Set `use_idle` to `false` (or use a server without IDLE) and confirm fetches still run on the poll interval.
 
 ### Data directory
 

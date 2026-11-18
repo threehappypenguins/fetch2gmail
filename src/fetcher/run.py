@@ -92,6 +92,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
     delete_after_import = imap_cfg.get("delete_after_import", True)
+    never_mark_spam = bool(imap_cfg.get("never_mark_spam", True))
     since_date = imap_cfg.get("since_date")
     if since_date == "":
         since_date = None
@@ -184,6 +185,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                     inbox_label_id=inbox_label_id,
                     unread_label_id=unread_label_id,
                     mark_unread=True,
+                    never_mark_spam=never_mark_spam,
                 )
                 any_imported = True
                 if first_gmail_id is None:
@@ -270,6 +272,7 @@ def run_copy_all(
     if not db_path.is_absolute():
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
+    never_mark_spam = bool(imap_cfg.get("never_mark_spam", True))
     since_date = imap_cfg.get("since_date")
     if since_date == "":
         since_date = None
@@ -379,6 +382,7 @@ def run_copy_all(
                         inbox_label_id=inbox_label_id,
                         unread_label_id=unread_label_id,
                         mark_unread=not msg.is_seen,
+                        never_mark_spam=never_mark_spam,
                     )
                     any_imported = True
                     if first_gmail_id is None:
