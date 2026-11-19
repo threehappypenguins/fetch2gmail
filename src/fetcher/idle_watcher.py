@@ -69,6 +69,18 @@ def next_backoff_seconds(attempt: int, base: float = _BACKOFF_BASE_SECONDS, cap:
     return min(cap, base * (2**attempt))
 
 
+def connection_identity(settings: dict[str, Any]) -> tuple[Any, ...]:
+    """Stable tuple of IMAP connection fields; change implies reconnect."""
+    return (
+        settings.get("host"),
+        int(settings.get("port", 993)),
+        settings.get("username"),
+        settings.get("password"),
+        settings.get("mailbox") or "INBOX",
+        bool(settings.get("use_ssl", True)),
+    )
+
+
 def enable_socket_keepalive(sock: socket.socket) -> None:
     """Enable SO_KEEPALIVE and Linux TCP keepalive knobs when available."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -132,16 +144,28 @@ def run_idle_session(
     idle_refresh_seconds: float,
     on_wake: Callable[[], None],
     check_chunk_seconds: float = _IDLE_CHECK_CHUNK_SECONDS,
-) -> None:
+    should_abort: Callable[[], bool] | None = None,
+) -> bool:
     """
-    Run IDLE until refresh deadline, new-mail notification, stop, or error.
+    Run IDLE until refresh deadline, new-mail notification, stop, abort, or error.
 
-    Calls on_wake when EXISTS/RECENT is seen. Raises on connection errors.
+    Calls on_wake when EXISTS/RECENT is seen or after a normal refresh.
+    should_abort is checked between idle_check chunks (e.g. connection settings changed).
+    Returns False if aborted early (no on_wake); True after a normal wake/refresh fetch.
+    Raises on connection errors.
     """
+    aborted = False
     idle_started = time.monotonic()
     client.idle()
     try:
         while not stop_event.is_set():
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        aborted = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
             remaining_refresh = idle_refresh_seconds - (time.monotonic() - idle_started)
             if remaining_refresh <= 0:
                 break
@@ -159,8 +183,8 @@ def run_idle_session(
         except Exception:  # noqa: BLE001
             logger.debug("idle_done failed", exc_info=True)
 
-    if stop_event.is_set():
-        return
+    if stop_event.is_set() or aborted:
+        return False
 
     # Liveness probe: silent NAT drops look like clean idle_check timeouts.
     client.noop()
@@ -168,6 +192,7 @@ def run_idle_session(
     # If we woke for new mail OR after refresh, run a fetch (refresh also catches
     # anything missed while IDLE was renewing / silent gaps).
     on_wake()
+    return True
 
 
 def run_poll_cycle(
@@ -177,22 +202,62 @@ def run_poll_cycle(
     on_wake: Callable[[], None],
     first_delay_seconds: float = 30.0,
     last_run_at: float | None,
-) -> float:
+    reload_during_wait: Callable[[], tuple[float, bool] | None] | None = None,
+    wait_chunk_seconds: float = 10.0,
+) -> tuple[float, bool]:
     """
     Wait until next poll time (interruptible), then call on_wake.
-    Returns new last_run_at (monotonic).
+
+    Every wait_chunk_seconds during the wait, optionally call reload_during_wait()
+    which may return (new_poll_interval_seconds, switch_to_idle). Interval changes
+    update next_run_at from last_run_at immediately; switch_to_idle=True returns
+    early without fetching so the caller can reconnect for IDLE.
+
+    Returns (last_run_at monotonic, switch_to_idle).
     """
     now = time.monotonic()
+    interval = float(poll_interval_seconds)
+    chunk = max(0.05, float(wait_chunk_seconds))
     if last_run_at is None:
         next_run_at = now + first_delay_seconds
     else:
-        next_run_at = last_run_at + poll_interval_seconds
+        next_run_at = last_run_at + interval
+
     while not stop_event.is_set() and time.monotonic() < next_run_at:
-        _wait_interruptible(stop_event, min(10.0, next_run_at - time.monotonic()))
+        _wait_interruptible(stop_event, min(chunk, next_run_at - time.monotonic()))
+        if stop_event.is_set():
+            break
+        if reload_during_wait is None:
+            continue
+        try:
+            refreshed = reload_during_wait()
+        except Exception:  # noqa: BLE001
+            continue
+        if refreshed is None:
+            continue
+        new_interval, switch_to_idle = refreshed
+        if switch_to_idle:
+            return (
+                last_run_at if last_run_at is not None else time.monotonic(),
+                True,
+            )
+        new_interval = max(1.0, float(new_interval))
+        if abs(new_interval - interval) < 1e-9:
+            continue
+        interval = new_interval
+        if last_run_at is None:
+            # Still in first-delay window; don't extend the wait on interval change.
+            next_run_at = min(next_run_at, time.monotonic() + interval)
+        else:
+            next_run_at = last_run_at + interval
+
     if stop_event.is_set():
-        return last_run_at if last_run_at is not None else time.monotonic()
+        return (
+            last_run_at if last_run_at is not None else time.monotonic(),
+            False,
+        )
     on_wake()
-    return time.monotonic()
+    return time.monotonic(), False
 
 
 def watcher_loop(
@@ -211,7 +276,8 @@ def watcher_loop(
     """
     backoff_attempt = 0
     poll_last_run_at: float | None = None
-    logged_no_idle = False
+    # connection_identity for which we last confirmed CAPABILITY lacks IDLE; None = unknown.
+    no_idle_conn_id: tuple[Any, ...] | None = None
 
     while not stop_event.is_set():
         settings = None
@@ -237,6 +303,7 @@ def watcher_loop(
         poll_interval_minutes = max(1, int(settings.get("poll_interval_minutes", 5)))
         idle_refresh_seconds = float(idle_refresh_minutes * 60)
         poll_interval_seconds = float(poll_interval_minutes * 60)
+        conn_id = connection_identity(settings)
 
         client: IMAPClient | None = None
         try:
@@ -252,51 +319,71 @@ def watcher_loop(
                 caps = client.capabilities()
                 can_idle = server_supports_idle(caps)
                 if not can_idle:
-                    if not logged_no_idle:
+                    if no_idle_conn_id != conn_id:
                         logger.info(
                             "IMAP server does not advertise IDLE; falling back to polling every %s minute(s)",
                             poll_interval_minutes,
                         )
-                        logged_no_idle = True
+                    no_idle_conn_id = conn_id
                     _close_client(client)
                     client = None
                 else:
-                    logged_no_idle = False
+                    no_idle_conn_id = None
                     logger.info(
                         "IMAP IDLE enabled (refresh every %s min; poll fallback interval %s min)",
                         idle_refresh_minutes,
                         poll_interval_minutes,
                     )
-                    backoff_attempt = 0
+                    idle_conn_id = conn_id
+                    leave_idle = False
+
+                    def _idle_should_abort() -> bool:
+                        nonlocal idle_refresh_minutes, idle_refresh_seconds
+                        nonlocal no_idle_conn_id, leave_idle
+                        refreshed = load_imap_settings()
+                        if not refreshed:
+                            return False
+                        idle_refresh_minutes = max(
+                            1,
+                            int(
+                                refreshed.get(
+                                    "idle_refresh_minutes", idle_refresh_minutes
+                                )
+                            ),
+                        )
+                        idle_refresh_seconds = float(idle_refresh_minutes * 60)
+                        if connection_identity(refreshed) != idle_conn_id:
+                            logger.info(
+                                "IMAP connection settings changed; reconnecting IDLE watcher"
+                            )
+                            no_idle_conn_id = None
+                            leave_idle = True
+                            return True
+                        if not bool(refreshed.get("use_idle", True)):
+                            logger.info(
+                                "IDLE disabled in config; switching to poll mode"
+                            )
+                            leave_idle = True
+                            return True
+                        return False
+
                     # Catch up on anything arrived while disconnected
                     on_fetch()
                     while not stop_event.is_set():
-                        try:
-                            refreshed = load_imap_settings()
-                            if refreshed:
-                                idle_refresh_minutes = max(
-                                    1,
-                                    int(
-                                        refreshed.get(
-                                            "idle_refresh_minutes", idle_refresh_minutes
-                                        )
-                                    ),
-                                )
-                                idle_refresh_seconds = float(idle_refresh_minutes * 60)
-                                if not bool(refreshed.get("use_idle", True)):
-                                    logger.info(
-                                        "IDLE disabled in config; switching to poll mode"
-                                    )
-                                    break
-                        except Exception:  # noqa: BLE001
-                            pass
-
-                        run_idle_session(
+                        completed = run_idle_session(
                             client,
                             stop_event=stop_event,
                             idle_refresh_seconds=idle_refresh_seconds,
                             on_wake=on_fetch,
+                            should_abort=_idle_should_abort,
                         )
+                        if leave_idle:
+                            break
+                        if not completed:
+                            # stop_event or abort without leave_idle flag
+                            break
+                        # Only clear backoff after a successful IDLE window; login/CAPABILITY
+                        # alone must not reset it (IDLE can still fail immediately after).
                         backoff_attempt = 0
                     else:
                         break
@@ -306,32 +393,46 @@ def watcher_loop(
 
             # Polling fallback (no IDLE capability, use_idle false, or switched off)
             backoff_attempt = 0
+            poll_conn_id = conn_id
+            prev_use_idle = use_idle
+
+            def _reload_poll_wait() -> tuple[float, bool] | None:
+                """Re-read poll interval / IDLE toggle / connection id during the wait."""
+                nonlocal poll_interval_minutes, poll_interval_seconds
+                nonlocal no_idle_conn_id, poll_conn_id, prev_use_idle
+                refreshed = load_imap_settings()
+                if not refreshed:
+                    return None
+                poll_interval_minutes = max(
+                    1,
+                    int(refreshed.get("poll_interval_minutes", poll_interval_minutes)),
+                )
+                poll_interval_seconds = float(poll_interval_minutes * 60)
+                new_conn_id = connection_identity(refreshed)
+                new_use_idle = bool(refreshed.get("use_idle", True))
+                if new_conn_id != poll_conn_id:
+                    # New host/account/mailbox: drop cached "no IDLE" for the old server.
+                    no_idle_conn_id = None
+                    poll_conn_id = new_conn_id
+                if new_use_idle and not prev_use_idle:
+                    # Explicit re-enable: force a fresh CAPABILITY check.
+                    no_idle_conn_id = None
+                prev_use_idle = new_use_idle
+                # Retry IDLE unless we already know *this* connection lacks it.
+                switch_to_idle = new_use_idle and no_idle_conn_id != new_conn_id
+                return poll_interval_seconds, switch_to_idle
+
             while not stop_event.is_set():
-                try:
-                    refreshed = load_imap_settings()
-                    if refreshed:
-                        poll_interval_minutes = max(
-                            1,
-                            int(
-                                refreshed.get(
-                                    "poll_interval_minutes", poll_interval_minutes
-                                )
-                            ),
-                        )
-                        poll_interval_seconds = float(poll_interval_minutes * 60)
-                        # Retry IDLE connect if enabled again and we have not learned
-                        # that this server lacks IDLE.
-                        if bool(refreshed.get("use_idle", True)) and not logged_no_idle:
-                            logger.info("Attempting IMAP IDLE (reconnect)")
-                            break
-                except Exception:  # noqa: BLE001
-                    pass
-                poll_last_run_at = run_poll_cycle(
+                poll_last_run_at, switch_to_idle = run_poll_cycle(
                     stop_event=stop_event,
                     poll_interval_seconds=poll_interval_seconds,
                     on_wake=on_fetch,
                     last_run_at=poll_last_run_at,
+                    reload_during_wait=_reload_poll_wait,
                 )
+                if switch_to_idle:
+                    logger.info("Attempting IMAP IDLE (reconnect)")
+                    break
 
         except Exception as e:
             _close_client(client)
