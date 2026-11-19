@@ -140,7 +140,13 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                         "deleted": deleted,
                     }
                 if msg is None:
-                    continue
+                    # Do not skip ahead: later duplicate handling must not advance
+                    # the watermark past an unreadable UID.
+                    logger.warning(
+                        "IMAP FETCH returned no body for uid=%s; stopping this run to retry later",
+                        uid,
+                    )
+                    break
 
                 if state.seen_hash(msg.message_hash):
                     logger.debug("Skipping duplicate (hash): uid=%s", msg.uid)
@@ -148,6 +154,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                     if not dry_run:
                         # Advance watermark even when not deleting so IDLE/pre-IDLE
                         # checks do not keep treating this UID as pending forever.
+                        # Safe only because we stop the run on earlier retryable failures.
                         state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
                         if delete_after_import:
                             try:
@@ -234,7 +241,13 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                     continue
 
                 if not any_imported or first_gmail_id is None:
-                    continue
+                    # Retryable failure: stop so a later duplicate cannot advance the
+                    # watermark past this undelivered UID.
+                    logger.warning(
+                        "Stopping fetch run after retryable import failure for uid=%s",
+                        msg.uid,
+                    )
+                    break
 
                 state.record_import(
                     msg.message_hash, first_gmail_id, mailbox, uid_validity, msg.uid
@@ -341,7 +354,11 @@ def run_copy_all(
                         "deleted": deleted,
                     }
                 if msg is None:
-                    continue
+                    logger.warning(
+                        "IMAP FETCH returned no body for uid=%s; stopping copy-all to retry later",
+                        uid,
+                    )
+                    break
 
                 # Copy-all is also used as a "repair" tool. With multiple Gmail accounts, we must not
                 # skip a message just because one account already has it; we should import to the missing
@@ -354,6 +371,7 @@ def run_copy_all(
                     logger.debug("Copy-all: skipping duplicate (hash): uid=%s", msg.uid)
                     skipped_duplicate += 1
                     if not dry_run:
+                        # Safe only because we stop the run on earlier retryable failures.
                         state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
                         if delete_after_import:
                             try:
@@ -394,6 +412,7 @@ def run_copy_all(
                 all_succeeded = True
                 any_imported = False
                 all_already_had = True
+                skip_entire_message = False
 
                 for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(
                     gmail_contexts
@@ -436,6 +455,7 @@ def run_copy_all(
                         logger.warning(
                             "Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e
                         )
+                        skip_entire_message = True
                         all_succeeded = False
                         break
                     except Exception as e:
@@ -448,8 +468,17 @@ def run_copy_all(
                         all_succeeded = False
                         break
 
-                if not all_succeeded:
+                if skip_entire_message:
+                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
                     continue
+
+                if not all_succeeded:
+                    # Retryable failure: do not let later duplicates advance past this UID.
+                    logger.warning(
+                        "Stopping copy-all after import failure for uid=%s",
+                        msg.uid,
+                    )
+                    break
 
                 if all_already_had and message_id_header:
                     skipped_duplicate += 1
@@ -474,7 +503,11 @@ def run_copy_all(
                     continue
 
                 if not any_imported and first_gmail_id is None:
-                    continue
+                    logger.warning(
+                        "Stopping copy-all after empty import result for uid=%s",
+                        msg.uid,
+                    )
+                    break
 
                 state.record_import(
                     msg.message_hash,
