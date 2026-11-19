@@ -1,21 +1,27 @@
 {
-  "imap": {
-    "host": "imap.example.com",
-    "port": 993,
-    "username": "your-isp-email@example.com",
-    "password_env": "IMAP_PASSWORD",
-    "mailbox": "INBOX",
-    "use_ssl": true,
-    "delete_after_import": true,
-    "never_mark_spam": true,
-    "use_idle": true,
-    "idle_refresh_minutes": 25
-  },
-  "gmail": {
-    "label": "ISP Mail",
-    "credentials_path": "credentials.json",
-    "token_path": "token.json"
-  },
+  "imap_accounts": [
+    {
+      "id": "default",
+      "host": "imap.example.com",
+      "port": 993,
+      "username": "your-isp-email@example.com",
+      "password_env": "IMAP_PASSWORD",
+      "mailbox": "INBOX",
+      "use_ssl": true,
+      "delete_after_import": true,
+      "never_mark_spam": true,
+      "use_idle": true,
+      "idle_refresh_minutes": 25,
+      "gmail_token_paths": []
+    }
+  ],
+  "gmail_accounts": [
+    {
+      "label": "ISP Mail",
+      "credentials_path": "credentials.json",
+      "token_path": "token.json"
+    }
+  ],
   "state": {
     "db_path": "state.db"
   },

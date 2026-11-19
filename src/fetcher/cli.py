@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import get_config_path, load_config
-from .run import run_once, setup_logging
+from .config import get_config_path, get_imap_accounts, load_config
+from .run import run_all_accounts, setup_logging
 
 
 def main() -> None:
@@ -95,7 +95,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
     setup_logging()
     config_path = args.config or str(get_config_path())
     try:
-        result = run_once(config_path=config_path, dry_run=args.dry_run)
+        # Run all IMAP accounts in one CLI invocation.
+        result = run_all_accounts(config_path=config_path, dry_run=args.dry_run)
     except FileNotFoundError as e:
         print(f"Config not found: {e}", file=sys.stderr)
         sys.exit(1)
@@ -111,6 +112,18 @@ def _cmd_run(args: argparse.Namespace) -> None:
     )
     if result.get("last_fetch_time"):
         print(f"Last fetch: {result['last_fetch_time']}")
+    accounts = result.get("accounts") or []
+    if len(accounts) > 1:
+        for acct in accounts:
+            aid = acct.get("account_id", "?")
+            err = acct.get("error")
+            if err:
+                print(f"  [{aid}] error: {err}", file=sys.stderr)
+            else:
+                print(
+                    f"  [{aid}] imported={acct.get('imported', 0)} "
+                    f"skipped={acct.get('skipped_duplicate', 0)} deleted={acct.get('deleted', 0)}"
+                )
 
 
 def _cmd_config(args: argparse.Namespace) -> None:
@@ -135,7 +148,11 @@ def _cmd_config(args: argparse.Namespace) -> None:
     if args.validate:
         config_path = args.config or str(get_config_path())
         try:
-            load_config(config_path)
+            from .config import get_gmail_destinations_for_imap
+
+            cfg = load_config(config_path)
+            for acct in get_imap_accounts(cfg):
+                get_gmail_destinations_for_imap(cfg, acct)
             print("Config OK.")
         except Exception as e:
             print(f"Invalid config: {e}", file=sys.stderr)
@@ -276,19 +293,32 @@ def _cmd_auth(args: argparse.Namespace) -> None:
 def _write_default_config(dest: Path) -> None:
     """Write a default config.json to dest."""
     cfg = {
-        "imap": {
-            "host": "imap.example.com",
-            "port": 993,
-            "username": "your-isp-email@example.com",
-            "password_env": "IMAP_PASSWORD",
-            "mailbox": "INBOX",
-            "use_ssl": True,
-            "delete_after_import": True,
-            "never_mark_spam": True,
-            "since_date": None,
-        },
+        "imap_accounts": [
+            {
+                "id": "default",
+                "host": "imap.example.com",
+                "port": 993,
+                "username": "your-isp-email@example.com",
+                "password_env": "IMAP_PASSWORD",
+                "mailbox": "INBOX",
+                "use_ssl": True,
+                "delete_after_import": True,
+                "never_mark_spam": True,
+                "use_idle": True,
+                "idle_refresh_minutes": 25,
+                "since_date": None,
+                "gmail_token_paths": [],
+            }
+        ],
         # Canonical: gmail_accounts (multi-account). Single-account setups will have one entry.
-        "gmail_accounts": [{"use_label": False, "label": "ISP Mail", "credentials_path": "credentials.json", "token_path": "token.json"}],
+        "gmail_accounts": [
+            {
+                "use_label": False,
+                "label": "ISP Mail",
+                "credentials_path": "credentials.json",
+                "token_path": "token.json",
+            }
+        ],
         "state": {"db_path": "state.db"},
         "ui": {"host": "127.0.0.1", "port": 8765},
         "poll_interval_minutes": 5,
@@ -311,18 +341,31 @@ def config_wizard_interactive() -> None:
     cred_path = input("Gmail OAuth credentials.json path [credentials.json]: ").strip() or "credentials.json"
     token_path = input("Gmail OAuth token path [token.json]: ").strip() or "token.json"
     cfg = {
-        "imap": {
-            "host": host,
-            "port": int(port),
-            "username": user,
-            "password_env": password_env,
-            "mailbox": mailbox,
-            "use_ssl": True,
-            "delete_after_import": True,
-            "never_mark_spam": True,
-            "since_date": None,
-        },
-        "gmail_accounts": [{"use_label": bool(label), "label": label or "ISP Mail", "credentials_path": cred_path, "token_path": token_path}],
+        "imap_accounts": [
+            {
+                "id": "default",
+                "host": host,
+                "port": int(port),
+                "username": user,
+                "password_env": password_env,
+                "mailbox": mailbox,
+                "use_ssl": True,
+                "delete_after_import": True,
+                "never_mark_spam": True,
+                "use_idle": True,
+                "idle_refresh_minutes": 25,
+                "since_date": None,
+                "gmail_token_paths": [],
+            }
+        ],
+        "gmail_accounts": [
+            {
+                "use_label": bool(label),
+                "label": label or "ISP Mail",
+                "credentials_path": cred_path,
+                "token_path": token_path,
+            }
+        ],
         "state": {"db_path": db_path},
         "ui": {"host": "127.0.0.1", "port": 8765},
         "poll_interval_minutes": 5,

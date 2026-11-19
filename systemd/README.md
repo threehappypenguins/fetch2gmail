@@ -1,6 +1,6 @@
 # systemd setup
 
-One service runs the web UI and the background fetch (polls your ISP mailbox every few minutes). Use **`fetch2gmail install-service`** to generate the unit file; see the main README.
+One service runs the web UI and background fetch (IDLE/poll for each configured IMAP account). Prefer configuring **multiple IMAP accounts in one process** (see the main README) instead of running multiple units. Use **`fetch2gmail install-service`** to generate the unit file.
 
 ## Quick install
 
@@ -13,7 +13,7 @@ sudo systemctl start fetch2gmail
 
 Replace **YOUR_USER** and **/opt/fetch2gmail** with your user and data directory. Run **`fetch2gmail set-ui-password`** once (from the data directory) so the UI is protected, then open http://server-ip:8765.
 
-To run a **second instance on a different port** (for another mailbox or config):
+To run a **second instance on a different port** (optional isolation; usually unnecessary for multi-IMAP):
 
 1. Generate a second unit with a different name (e.g. `fetch2gmail2.service`) and write it to `/tmp`:
    ```bash
