@@ -14,7 +14,8 @@ import socket
 import ssl
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from imapclient import IMAPClient
@@ -30,6 +31,58 @@ _AUTH_BACKOFF_SECONDS = 300.0
 _TCP_KEEPIDLE = 60
 _TCP_KEEPINTVL = 30
 _TCP_KEEPCNT = 5
+
+# Coordinate releasing the long-lived IDLE connection during imports so ISP
+# accounts limited to 2 concurrent IMAP sessions can still fetch+delete.
+_idle_gate = threading.Condition()
+_idle_suspend_count = 0
+_idle_connection_held = False
+
+
+def _idle_suspend_requested() -> bool:
+    with _idle_gate:
+        return _idle_suspend_count > 0
+
+
+def _set_idle_connection_held(held: bool) -> None:
+    global _idle_connection_held
+    with _idle_gate:
+        _idle_connection_held = held
+        _idle_gate.notify_all()
+
+
+def _wait_until_idle_allowed(stop_event: threading.Event) -> bool:
+    """Block while imports have paused IDLE. Return False if stop was requested."""
+    while not stop_event.is_set():
+        with _idle_gate:
+            if _idle_suspend_count == 0:
+                return True
+            _idle_gate.wait(timeout=0.5)
+    return False
+
+
+@contextmanager
+def pause_idle_connection(timeout_seconds: float = 60.0) -> Iterator[None]:
+    """
+    Drop (or wait for) the IDLE watcher connection for the duration of an import.
+
+    Use around run_once / run_copy_all so manual UI fetches do not compete with IDLE
+    for scarce IMAP connection slots.
+    """
+    global _idle_suspend_count
+    with _idle_gate:
+        _idle_suspend_count += 1
+        _idle_gate.notify_all()
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while _idle_connection_held and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            _idle_gate.wait(timeout=min(0.5, max(0.05, remaining)))
+    try:
+        yield
+    finally:
+        with _idle_gate:
+            _idle_suspend_count = max(0, _idle_suspend_count - 1)
+            _idle_gate.notify_all()
 
 
 def server_supports_idle(capabilities: Any) -> bool:
@@ -352,62 +405,121 @@ def watcher_loop(
                         idle_refresh_minutes,
                         poll_interval_minutes,
                     )
-                    idle_conn_id = conn_id
-                    leave_idle = False
-
-                    def _idle_should_abort() -> bool:
-                        nonlocal idle_refresh_minutes, idle_refresh_seconds
-                        nonlocal no_idle_conn_id, leave_idle
-                        refreshed = load_imap_settings()
-                        if not refreshed:
-                            return False
-                        idle_refresh_minutes = max(
-                            1,
-                            int(
-                                refreshed.get(
-                                    "idle_refresh_minutes", idle_refresh_minutes
-                                )
-                            ),
-                        )
-                        idle_refresh_seconds = float(idle_refresh_minutes * 60)
-                        if connection_identity(refreshed) != idle_conn_id:
-                            logger.info(
-                                "IMAP connection settings changed; reconnecting IDLE watcher"
-                            )
-                            no_idle_conn_id = None
-                            leave_idle = True
-                            return True
-                        if not bool(refreshed.get("use_idle", True)):
-                            logger.info(
-                                "IDLE disabled in config; switching to poll mode"
-                            )
-                            leave_idle = True
-                            return True
-                        return False
-
-                    # Catch up on anything arrived while disconnected
-                    on_fetch()
-                    while not stop_event.is_set():
-                        completed = run_idle_session(
-                            client,
-                            stop_event=stop_event,
-                            # Callable so _idle_should_abort updates apply mid-session.
-                            idle_refresh_seconds=lambda: idle_refresh_seconds,
-                            on_wake=on_fetch,
-                            should_abort=_idle_should_abort,
-                        )
-                        if leave_idle:
-                            break
-                        if not completed:
-                            # stop_event or abort without leave_idle flag
-                            break
-                        # Only clear backoff after a successful IDLE window; login/CAPABILITY
-                        # alone must not reset it (IDLE can still fail immediately after).
-                        backoff_attempt = 0
-                    else:
-                        break
+                    # Do not hold the IDLE connection during catch-up import (2-conn ISPs).
                     _close_client(client)
                     client = None
+                    on_fetch()
+
+                    while not stop_event.is_set():
+                        if not _wait_until_idle_allowed(stop_event):
+                            break
+                        # Re-read settings in case host/mailbox changed during import.
+                        try:
+                            refreshed = load_imap_settings()
+                        except Exception:  # noqa: BLE001
+                            refreshed = None
+                        if refreshed:
+                            if connection_identity(refreshed) != conn_id:
+                                no_idle_conn_id = None
+                                break
+                            if not bool(refreshed.get("use_idle", True)):
+                                logger.info(
+                                    "IDLE disabled in config; switching to poll mode"
+                                )
+                                break
+                            idle_refresh_minutes = max(
+                                1,
+                                int(
+                                    refreshed.get(
+                                        "idle_refresh_minutes", idle_refresh_minutes
+                                    )
+                                ),
+                            )
+                            idle_refresh_seconds = float(idle_refresh_minutes * 60)
+                            host = refreshed["host"]
+                            port = int(refreshed.get("port", 993))
+                            username = refreshed["username"]
+                            password = refreshed["password"]
+                            mailbox = refreshed.get("mailbox") or "INBOX"
+                            use_ssl = bool(refreshed.get("use_ssl", True))
+                            conn_id = connection_identity(refreshed)
+
+                        client = connect_idle_client(
+                            host=host,
+                            port=port,
+                            username=username,
+                            password=password,
+                            mailbox=mailbox,
+                            use_ssl=use_ssl,
+                        )
+                        idle_conn_id = conn_id
+                        leave_idle = False
+                        _set_idle_connection_held(True)
+
+                        def _idle_should_abort() -> bool:
+                            nonlocal idle_refresh_minutes, idle_refresh_seconds
+                            nonlocal no_idle_conn_id, leave_idle
+                            if _idle_suspend_requested():
+                                leave_idle = True
+                                return True
+                            refreshed_inner = load_imap_settings()
+                            if not refreshed_inner:
+                                return False
+                            idle_refresh_minutes = max(
+                                1,
+                                int(
+                                    refreshed_inner.get(
+                                        "idle_refresh_minutes", idle_refresh_minutes
+                                    )
+                                ),
+                            )
+                            idle_refresh_seconds = float(idle_refresh_minutes * 60)
+                            if connection_identity(refreshed_inner) != idle_conn_id:
+                                logger.info(
+                                    "IMAP connection settings changed; reconnecting IDLE watcher"
+                                )
+                                no_idle_conn_id = None
+                                leave_idle = True
+                                return True
+                            if not bool(refreshed_inner.get("use_idle", True)):
+                                logger.info(
+                                    "IDLE disabled in config; switching to poll mode"
+                                )
+                                leave_idle = True
+                                return True
+                            return False
+
+                        try:
+                            # on_wake is a no-op: fetch only after we drop this connection.
+                            need_fetch = run_idle_session(
+                                client,
+                                stop_event=stop_event,
+                                idle_refresh_seconds=lambda: idle_refresh_seconds,
+                                on_wake=lambda: None,
+                                should_abort=_idle_should_abort,
+                            )
+                        finally:
+                            _close_client(client)
+                            client = None
+                            _set_idle_connection_held(False)
+
+                        if stop_event.is_set():
+                            break
+                        if leave_idle and not need_fetch:
+                            # Suspend, settings change, or IDLE disabled without a mailbox wake.
+                            if _idle_suspend_requested():
+                                # Wait for the import that paused us, then resume IDLE.
+                                if not _wait_until_idle_allowed(stop_event):
+                                    break
+                                continue
+                            break
+                        if need_fetch:
+                            on_fetch()
+                            # Only clear backoff after a successful IDLE window that led to fetch.
+                            backoff_attempt = 0
+                            continue
+                        # aborted without fetch (e.g. stop during idle_done path)
+                        break
                     continue
 
             # Polling fallback (no IDLE capability, use_idle false, or switched off)

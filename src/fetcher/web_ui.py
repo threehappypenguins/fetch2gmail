@@ -25,7 +25,7 @@ import imaplib
 from .config import get_config_path, get_gmail_accounts, load_config
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
-from .idle_watcher import watcher_loop
+from .idle_watcher import pause_idle_connection, watcher_loop
 from .imap_client import get_uid_validity
 from .log_buffer import get_recent_logs, install_log_buffer
 from .run import run_once, run_copy_all, setup_logging
@@ -62,9 +62,10 @@ def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
 
 
 def _run_once_locked(config_path: str, dry_run: bool = False) -> dict[str, Any]:
-    """Run one fetch cycle under the shared fetch lock."""
+    """Run one fetch cycle under the shared fetch lock (IDLE connection paused)."""
     with _fetch_lock:
-        return run_once(config_path=config_path, dry_run=dry_run)
+        with pause_idle_connection():
+            return run_once(config_path=config_path, dry_run=dry_run)
 
 
 def _watcher_on_fetch() -> None:
@@ -856,11 +857,12 @@ def api_fetch_copy_all(request: Request, body: CopyAllBody) -> dict[str, Any]:
     install_log_buffer()
     try:
         with _fetch_lock:
-            result = run_copy_all(
-                config_path=str(_get_config_path()),
-                delete_after_import=body.delete_after,
-                dry_run=False,
-            )
+            with pause_idle_connection():
+                result = run_copy_all(
+                    config_path=str(_get_config_path()),
+                    delete_after_import=body.delete_after,
+                    dry_run=False,
+                )
         return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
