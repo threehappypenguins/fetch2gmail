@@ -145,15 +145,20 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
                 if state.seen_hash(msg.message_hash):
                     logger.debug("Skipping duplicate (hash): uid=%s", msg.uid)
                     skipped_duplicate += 1
-                    if not dry_run and delete_after_import:
-                        try:
-                            imap.delete_uid(msg.uid)
-                            state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-                            deleted += 1
-                        except Exception as e:
-                            logger.warning(
-                                "Delete (duplicate) failed for uid=%s: %s", msg.uid, e
-                            )
+                    if not dry_run:
+                        # Advance watermark even when not deleting so IDLE/pre-IDLE
+                        # checks do not keep treating this UID as pending forever.
+                        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                        if delete_after_import:
+                            try:
+                                imap.delete_uid(msg.uid)
+                                deleted += 1
+                            except Exception as e:
+                                logger.warning(
+                                    "Delete (duplicate) failed for uid=%s: %s",
+                                    msg.uid,
+                                    e,
+                                )
                     continue
 
                 if dry_run:
@@ -348,15 +353,18 @@ def run_copy_all(
                 if len(gmail_accounts) <= 1 and state.seen_hash(msg.message_hash):
                     logger.debug("Copy-all: skipping duplicate (hash): uid=%s", msg.uid)
                     skipped_duplicate += 1
-                    if not dry_run and delete_after_import:
-                        try:
-                            imap.delete_uid(msg.uid)
-                            state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-                            deleted += 1
-                        except Exception as e:
-                            logger.warning(
-                                "Delete (duplicate) failed for uid=%s: %s", msg.uid, e
-                            )
+                    if not dry_run:
+                        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                        if delete_after_import:
+                            try:
+                                imap.delete_uid(msg.uid)
+                                deleted += 1
+                            except Exception as e:
+                                logger.warning(
+                                    "Delete (duplicate) failed for uid=%s: %s",
+                                    msg.uid,
+                                    e,
+                                )
                     continue
 
                 if dry_run:

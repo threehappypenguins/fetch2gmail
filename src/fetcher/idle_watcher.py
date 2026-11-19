@@ -498,11 +498,10 @@ def watcher_loop(
                     client = None
                     ok = invoke_on_fetch(on_fetch)
                     catchup_streak += 1
-                    if ok:
-                        backoff_attempt = 0
-                    else:
-                        delay = next_backoff_seconds(backoff_attempt)
-                        backoff_attempt += 1
+                    # Import retry pacing stays on catchup_streak; do not clear
+                    # backoff_attempt here (login can succeed while IDLE keeps failing).
+                    if not ok:
+                        delay = next_backoff_seconds(catchup_streak - 1)
                         logger.warning(
                             "Initial catch-up fetch failed; waiting %.0fs before retry",
                             delay,
@@ -589,11 +588,12 @@ def watcher_loop(
                                 return True
                             return False
 
+                        need_fetch = False
+                        completed_idle = False
                         try:
                             # Mail may have arrived after the last import SEARCH but before
                             # this SELECT; that will not generate a later IDLE EXISTS. Check
                             # on the watcher connection, then drop it before importing.
-                            need_fetch = False
                             since_date = None
                             if refreshed:
                                 since_date = refreshed.get("since_date")
@@ -634,6 +634,8 @@ def watcher_loop(
                                     on_wake=lambda: None,
                                     should_abort=_idle_should_abort,
                                 )
+                                # True means IDLE ran to EXISTS/refresh (not abort).
+                                completed_idle = need_fetch
                         finally:
                             _close_client(client)
                             client = None
@@ -650,7 +652,10 @@ def watcher_loop(
                                 continue
                             break
                         if need_fetch:
-                            # Pace retries when the previous catch-up left pending UIDs
+                            if completed_idle:
+                                # Only clear reconnect backoff after a successful IDLE window.
+                                backoff_attempt = 0
+                            # Pace import retries separately when pending UIDs remain
                             # (e.g. Gmail auth failure) or this is a repeat after failure.
                             if catchup_streak > 0:
                                 delay = next_backoff_seconds(catchup_streak - 1)
@@ -661,15 +666,8 @@ def watcher_loop(
                                 )
                                 if _wait_interruptible(stop_event, delay):
                                     break
-                            ok = invoke_on_fetch(on_fetch)
+                            invoke_on_fetch(on_fetch)
                             catchup_streak += 1
-                            if ok:
-                                backoff_attempt = 0
-                            else:
-                                # Failed import: keep connection backoff in sync too.
-                                backoff_attempt = max(
-                                    backoff_attempt, catchup_streak - 1
-                                )
                             continue
                         # aborted without fetch (e.g. stop during idle_done path)
                         break
