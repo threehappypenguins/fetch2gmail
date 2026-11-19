@@ -9,6 +9,7 @@ Long-lived IMAP IDLE watcher with polling fallback.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import socket
 import ssl
@@ -143,6 +144,53 @@ def connection_identity(settings: dict[str, Any]) -> tuple[Any, ...]:
         settings.get("mailbox") or "INBOX",
         bool(settings.get("use_ssl", True)),
     )
+
+
+def selected_uid_validity(client: IMAPClient, mailbox: str) -> int | None:
+    """Return UIDVALIDITY for the selected mailbox, or None on failure."""
+    try:
+        status = client.folder_status(mailbox, ["UIDVALIDITY"])
+    except Exception:  # noqa: BLE001
+        logger.debug("folder_status UIDVALIDITY failed", exc_info=True)
+        return None
+    if not status:
+        return None
+    raw = status.get(b"UIDVALIDITY", status.get("UIDVALIDITY"))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def mailbox_has_unprocessed_uids(
+    client: IMAPClient,
+    *,
+    last_processed_uid: int | None,
+    since: str | datetime.date | None = None,
+) -> bool:
+    """
+    True if SEARCH finds UIDs that run_once would consider new.
+
+    Call after SELECT and before IDLE so mail that arrived during the previous
+    import (or pause) is not missed until the next refresh window.
+    """
+    criteria: list[Any] = []
+    if last_processed_uid is not None:
+        criteria.extend(["UID", f"{last_processed_uid + 1}:*"])
+    else:
+        criteria.append("ALL")
+    if since not in (None, ""):
+        if isinstance(since, str):
+            since = datetime.date.fromisoformat(since)
+        criteria.extend(["SINCE", since])
+    try:
+        uids = client.search(criteria)
+    except Exception:  # noqa: BLE001
+        logger.debug("pre-IDLE UID SEARCH failed", exc_info=True)
+        return False
+    return bool(uids)
 
 
 def enable_socket_keepalive(sock: socket.socket) -> None:
@@ -336,14 +384,18 @@ def watcher_loop(
     *,
     load_imap_settings: Callable[[], dict[str, Any] | None],
     on_fetch: Callable[[], None],
+    get_last_processed_uid: Callable[[str, int], int | None] | None = None,
 ) -> None:
     """
     Main background loop: connect, IDLE or poll, reconnect with backoff.
 
     load_imap_settings() should return a dict with:
       host, port, username, password, mailbox, use_ssl,
-      use_idle, idle_refresh_minutes, poll_interval_minutes
+      use_idle, idle_refresh_minutes, poll_interval_minutes, since_date
     or None if config is not ready.
+
+    get_last_processed_uid(mailbox, uid_validity) supplies the watermark used to
+    detect unprocessed UIDs after SELECT before entering IDLE.
     """
     backoff_attempt = 0
     poll_last_run_at: float | None = None
@@ -490,14 +542,48 @@ def watcher_loop(
                             return False
 
                         try:
-                            # on_wake is a no-op: fetch only after we drop this connection.
-                            need_fetch = run_idle_session(
-                                client,
-                                stop_event=stop_event,
-                                idle_refresh_seconds=lambda: idle_refresh_seconds,
-                                on_wake=lambda: None,
-                                should_abort=_idle_should_abort,
-                            )
+                            # Mail may have arrived after the last import SEARCH but before
+                            # this SELECT; that will not generate a later IDLE EXISTS. Check
+                            # on the watcher connection, then drop it before importing.
+                            need_fetch = False
+                            since_date = None
+                            if refreshed:
+                                since_date = refreshed.get("since_date")
+                            elif settings:
+                                since_date = settings.get("since_date")
+                            uid_validity = selected_uid_validity(client, mailbox)
+                            if (
+                                get_last_processed_uid is not None
+                                and uid_validity is not None
+                            ):
+                                try:
+                                    last_uid = get_last_processed_uid(
+                                        mailbox, uid_validity
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "get_last_processed_uid failed",
+                                        exc_info=True,
+                                    )
+                                    last_uid = None
+                                if mailbox_has_unprocessed_uids(
+                                    client,
+                                    last_processed_uid=last_uid,
+                                    since=since_date,
+                                ):
+                                    logger.info(
+                                        "IDLE: unprocessed UIDs after SELECT; fetching before IDLE"
+                                    )
+                                    need_fetch = True
+                            if not need_fetch:
+                                # on_wake is a no-op: fetch only after we drop this connection.
+                                need_fetch = run_idle_session(
+                                    client,
+                                    stop_event=stop_event,
+                                    idle_refresh_seconds=lambda: idle_refresh_seconds,
+                                    on_wake=lambda: None,
+                                    should_abort=_idle_should_abort,
+                                )
                         finally:
                             _close_client(client)
                             client = None

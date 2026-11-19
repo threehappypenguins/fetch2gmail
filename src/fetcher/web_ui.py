@@ -29,6 +29,7 @@ from .idle_watcher import pause_idle_connection, watcher_loop
 from .imap_client import get_uid_validity
 from .log_buffer import get_recent_logs, install_log_buffer
 from .run import run_once, run_copy_all, setup_logging
+from .state import StateStore
 from .ui_auth import create_ui_auth, load_ui_auth, verify_ui_auth
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,9 @@ def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
     imap = cfg.get("imap") or {}
     if not imap.get("host") or not imap.get("username") or not imap.get("password"):
         return None
+    since_date = imap.get("since_date")
+    if since_date == "":
+        since_date = None
     return {
         "host": imap["host"],
         "port": int(imap.get("port", 993)),
@@ -58,7 +62,29 @@ def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
         "use_idle": bool(imap.get("use_idle", True)),
         "idle_refresh_minutes": max(1, int(imap.get("idle_refresh_minutes", 25))),
         "poll_interval_minutes": max(1, int(cfg.get("poll_interval_minutes", 5))),
+        "since_date": since_date,
+        "state_db_path": str((cfg.get("state") or {}).get("db_path", "state.db")),
+        "config_dir": str(path.resolve().parent),
     }
+
+
+def _watcher_last_processed_uid(mailbox: str, uid_validity: int) -> int | None:
+    """Read last_processed_uid from state.db for pre-IDLE pending-mail checks."""
+    if not _config_exists():
+        return None
+    path = _get_config_path()
+    cfg = load_config(path, resolve_password=False)
+    config_dir = path.resolve().parent
+    raw_db = (cfg.get("state") or {}).get("db_path", "state.db")
+    db_path = Path(raw_db)
+    if not db_path.is_absolute():
+        db_path = config_dir / db_path
+    state = StateStore(str(db_path))
+    try:
+        state.connect()
+        return state.get_last_processed_uid(mailbox, uid_validity)
+    finally:
+        state.close()
 
 
 def _run_once_locked(config_path: str, dry_run: bool = False) -> dict[str, Any]:
@@ -96,6 +122,7 @@ def _watcher_thread_main(stop_event: threading.Event) -> None:
         stop_event,
         load_imap_settings=_load_imap_settings_for_watcher,
         on_fetch=_watcher_on_fetch,
+        get_last_processed_uid=_watcher_last_processed_uid,
     )
 
 

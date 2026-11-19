@@ -11,9 +11,11 @@ import pytest
 from fetcher.idle_watcher import (
     connection_identity,
     idle_responses_indicate_new_mail,
+    mailbox_has_unprocessed_uids,
     next_backoff_seconds,
     run_idle_session,
     run_poll_cycle,
+    selected_uid_validity,
     server_supports_idle,
 )
 
@@ -74,6 +76,33 @@ def test_connection_identity_changes_with_mailbox():
     other = {**base, "mailbox": "Archive"}
     assert connection_identity(base) != connection_identity(other)
     assert connection_identity(base) == connection_identity(dict(base))
+
+
+def test_mailbox_has_unprocessed_uids_searches_after_watermark():
+    client = MagicMock()
+    client.search.return_value = [101]
+    assert (
+        mailbox_has_unprocessed_uids(client, last_processed_uid=100, since=None) is True
+    )
+    client.search.assert_called_once_with(["UID", "101:*"])
+
+    client.search.return_value = []
+    assert (
+        mailbox_has_unprocessed_uids(client, last_processed_uid=100, since=None) is False
+    )
+
+
+def test_mailbox_has_unprocessed_uids_all_when_no_watermark():
+    client = MagicMock()
+    client.search.return_value = [1]
+    assert mailbox_has_unprocessed_uids(client, last_processed_uid=None) is True
+    client.search.assert_called_once_with(["ALL"])
+
+
+def test_selected_uid_validity_parses_status():
+    client = MagicMock()
+    client.folder_status.return_value = {b"UIDVALIDITY": 42}
+    assert selected_uid_validity(client, "INBOX") == 42
 
 
 def test_no_idle_cache_is_scoped_to_connection_identity():
