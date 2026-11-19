@@ -57,6 +57,11 @@ def test_next_backoff_seconds_doubles_and_caps():
     assert next_backoff_seconds(-1, base=5, cap=300) == 5
 
 
+def test_next_backoff_seconds_large_attempt_does_not_overflow():
+    assert next_backoff_seconds(1024, base=5, cap=300) == 300
+    assert next_backoff_seconds(10_000, base=5, cap=300) == 300
+
+
 def test_connection_identity_changes_with_mailbox():
     base = {
         "host": "imap.example.com",
@@ -165,6 +170,38 @@ def test_run_idle_session_aborts_on_should_abort_without_fetch():
     client.idle_done.assert_called_once()
     client.noop.assert_not_called()
     assert wakes == []
+
+
+def test_run_idle_session_applies_shorter_refresh_via_callable():
+    """Lowering refresh mid-session should end the wait early (not keep old deadline)."""
+    client = MagicMock()
+    client.idle_check.return_value = []
+    wakes: list[int] = []
+    stop = threading.Event()
+    refresh = {"seconds": 60.0}
+    checks = {"n": 0}
+
+    def should_abort():
+        checks["n"] += 1
+        if checks["n"] >= 2:
+            refresh["seconds"] = 0.05
+        return False
+
+    started = time.monotonic()
+    ok = run_idle_session(
+        client,
+        stop_event=stop,
+        idle_refresh_seconds=lambda: refresh["seconds"],
+        on_wake=lambda: wakes.append(1),
+        check_chunk_seconds=0.05,
+        should_abort=should_abort,
+    )
+    elapsed = time.monotonic() - started
+
+    assert ok is True
+    assert wakes == [1]
+    assert elapsed < 2.0
+    client.noop.assert_called_once()
 
 
 def test_run_poll_cycle_applies_shorter_interval_during_wait():

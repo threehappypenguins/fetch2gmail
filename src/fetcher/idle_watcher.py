@@ -63,10 +63,21 @@ def idle_responses_indicate_new_mail(responses: list[Any] | None) -> bool:
 
 
 def next_backoff_seconds(attempt: int, base: float = _BACKOFF_BASE_SECONDS, cap: float = _BACKOFF_CAP_SECONDS) -> float:
-    """Exponential backoff: base * 2^attempt, capped. attempt is 0-based."""
+    """Exponential backoff: base * 2^attempt, capped. attempt is 0-based.
+
+    Doubling stops once the delay reaches cap so large attempt values cannot
+    OverflowError (e.g. 2**1024) during a long outage.
+    """
     if attempt < 0:
         attempt = 0
-    return min(cap, base * (2**attempt))
+    if base <= 0:
+        return float(cap)
+    delay = float(base)
+    for _ in range(attempt):
+        if delay >= cap:
+            return float(cap)
+        delay *= 2.0
+    return min(float(cap), delay)
 
 
 def connection_identity(settings: dict[str, Any]) -> tuple[Any, ...]:
@@ -141,7 +152,7 @@ def run_idle_session(
     client: IMAPClient,
     *,
     stop_event: threading.Event,
-    idle_refresh_seconds: float,
+    idle_refresh_seconds: float | Callable[[], float],
     on_wake: Callable[[], None],
     check_chunk_seconds: float = _IDLE_CHECK_CHUNK_SECONDS,
     should_abort: Callable[[], bool] | None = None,
@@ -151,9 +162,15 @@ def run_idle_session(
 
     Calls on_wake when EXISTS/RECENT is seen or after a normal refresh.
     should_abort is checked between idle_check chunks (e.g. connection settings changed).
+    idle_refresh_seconds may be a float or a callable so UI changes to the refresh
+    interval apply during the current wait (not only on the next session).
     Returns False if aborted early (no on_wake); True after a normal wake/refresh fetch.
     Raises on connection errors.
     """
+    def _refresh_limit() -> float:
+        raw = idle_refresh_seconds() if callable(idle_refresh_seconds) else idle_refresh_seconds
+        return max(1.0, float(raw))
+
     aborted = False
     idle_started = time.monotonic()
     client.idle()
@@ -166,7 +183,8 @@ def run_idle_session(
                         break
                 except Exception:  # noqa: BLE001
                     pass
-            remaining_refresh = idle_refresh_seconds - (time.monotonic() - idle_started)
+            # Re-read limit each chunk so idle_refresh_minutes changes take effect now.
+            remaining_refresh = _refresh_limit() - (time.monotonic() - idle_started)
             if remaining_refresh <= 0:
                 break
             timeout = min(check_chunk_seconds, remaining_refresh)
@@ -373,7 +391,8 @@ def watcher_loop(
                         completed = run_idle_session(
                             client,
                             stop_event=stop_event,
-                            idle_refresh_seconds=idle_refresh_seconds,
+                            # Callable so _idle_should_abort updates apply mid-session.
+                            idle_refresh_seconds=lambda: idle_refresh_seconds,
                             on_wake=on_fetch,
                             should_abort=_idle_should_abort,
                         )
