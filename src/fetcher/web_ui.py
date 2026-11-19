@@ -94,8 +94,8 @@ def _run_once_locked(config_path: str, dry_run: bool = False) -> dict[str, Any]:
             return run_once(config_path=config_path, dry_run=dry_run)
 
 
-def _watcher_on_fetch() -> None:
-    """Callback for IDLE/poll wakes: run import once and log the result."""
+def _watcher_on_fetch() -> bool:
+    """Callback for IDLE/poll wakes: run import once; return True on success."""
     try:
         path = _get_config_path()
         setup_logging()
@@ -103,17 +103,20 @@ def _watcher_on_fetch() -> None:
         result = _run_once_locked(config_path=str(path), dry_run=False)
         if result.get("error"):
             logger.warning("Background fetch error: %s", result["error"])
-        else:
-            logger.info(
-                "Background fetch: imported=%s skipped=%s deleted=%s",
-                result.get("imported", 0),
-                result.get("skipped_duplicate", 0),
-                result.get("deleted", 0),
-            )
+            return False
+        logger.info(
+            "Background fetch: imported=%s skipped=%s deleted=%s",
+            result.get("imported", 0),
+            result.get("skipped_duplicate", 0),
+            result.get("deleted", 0),
+        )
+        return True
     except ValueError as e:
         logger.warning("Background fetch skipped: %s", e)
+        return False
     except Exception as e:
         logger.exception("Background fetch failed: %s", e)
+        return False
 
 
 def _watcher_thread_main(stop_event: threading.Event) -> None:

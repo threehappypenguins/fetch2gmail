@@ -11,6 +11,7 @@ import pytest
 from fetcher.idle_watcher import (
     connection_identity,
     idle_responses_indicate_new_mail,
+    invoke_on_fetch,
     mailbox_has_unprocessed_uids,
     next_backoff_seconds,
     run_idle_session,
@@ -78,6 +79,19 @@ def test_connection_identity_changes_with_mailbox():
     assert connection_identity(base) == connection_identity(dict(base))
 
 
+def test_invoke_on_fetch_interprets_results():
+    assert invoke_on_fetch(lambda: None) is True
+    assert invoke_on_fetch(lambda: True) is True
+    assert invoke_on_fetch(lambda: False) is False
+    assert invoke_on_fetch(lambda: {"imported": 1}) is True
+    assert invoke_on_fetch(lambda: {"error": "boom"}) is False
+
+    def _raise():
+        raise RuntimeError("nope")
+
+    assert invoke_on_fetch(_raise) is False
+
+
 def test_mailbox_has_unprocessed_uids_searches_after_watermark():
     client = MagicMock()
     client.search.return_value = [101]
@@ -87,6 +101,15 @@ def test_mailbox_has_unprocessed_uids_searches_after_watermark():
     client.search.assert_called_once_with(["UID", "101:*"])
 
     client.search.return_value = []
+    assert (
+        mailbox_has_unprocessed_uids(client, last_processed_uid=100, since=None) is False
+    )
+
+
+def test_mailbox_has_unprocessed_uids_ignores_inclusive_watermark_hit():
+    """UID (last+1):* may still return last when it is the highest UID."""
+    client = MagicMock()
+    client.search.return_value = [100]
     assert (
         mailbox_has_unprocessed_uids(client, last_processed_uid=100, since=None) is False
     )

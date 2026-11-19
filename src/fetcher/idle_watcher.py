@@ -164,6 +164,27 @@ def selected_uid_validity(client: IMAPClient, mailbox: str) -> int | None:
         return None
 
 
+def invoke_on_fetch(on_fetch: Callable[[], Any]) -> bool:
+    """
+    Run the import callback and return True if it reported success.
+
+    Accepts None (legacy void), bool, or a run_once-style dict with optional "error".
+    Exceptions are caught and treated as failure so the watcher can back off.
+    """
+    try:
+        result = on_fetch()
+    except Exception:  # noqa: BLE001
+        logger.exception("Fetch callback failed")
+        return False
+    if result is None:
+        return True
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, dict):
+        return not result.get("error")
+    return True
+
+
 def mailbox_has_unprocessed_uids(
     client: IMAPClient,
     *,
@@ -175,6 +196,10 @@ def mailbox_has_unprocessed_uids(
 
     Call after SELECT and before IDLE so mail that arrived during the previous
     import (or pause) is not missed until the next refresh window.
+
+    Some servers treat UID ranges inclusively such that ``UID (last+1):*`` still
+    returns ``last`` when it is the highest UID. Filter to UIDs strictly greater
+    than the watermark so a fully processed mailbox can settle into IDLE.
     """
     criteria: list[Any] = []
     if last_processed_uid is not None:
@@ -190,7 +215,11 @@ def mailbox_has_unprocessed_uids(
     except Exception:  # noqa: BLE001
         logger.debug("pre-IDLE UID SEARCH failed", exc_info=True)
         return False
-    return bool(uids)
+    if not uids:
+        return False
+    if last_processed_uid is None:
+        return True
+    return any(int(uid) > last_processed_uid for uid in uids)
 
 
 def enable_socket_keepalive(sock: socket.socket) -> None:
@@ -383,7 +412,7 @@ def watcher_loop(
     stop_event: threading.Event,
     *,
     load_imap_settings: Callable[[], dict[str, Any] | None],
-    on_fetch: Callable[[], None],
+    on_fetch: Callable[[], Any],
     get_last_processed_uid: Callable[[str, int], int | None] | None = None,
 ) -> None:
     """
@@ -396,8 +425,15 @@ def watcher_loop(
 
     get_last_processed_uid(mailbox, uid_validity) supplies the watermark used to
     detect unprocessed UIDs after SELECT before entering IDLE.
+
+    on_fetch may return None/True on success, False on failure, or a dict with
+    an "error" key. Failed or no-progress catch-up fetches use exponential backoff
+    so persistent import errors do not spin.
     """
     backoff_attempt = 0
+    # Consecutive catch-up fetches that have not yet been followed by a clean IDLE.
+    # Used to pace retries when pending UIDs remain after a failed/partial import.
+    catchup_streak = 0
     poll_last_run_at: float | None = None
     # connection_identity for which we last confirmed CAPABILITY lacks IDLE; None = unknown.
     no_idle_conn_id: tuple[Any, ...] | None = None
@@ -460,7 +496,19 @@ def watcher_loop(
                     # Do not hold the IDLE connection during catch-up import (2-conn ISPs).
                     _close_client(client)
                     client = None
-                    on_fetch()
+                    ok = invoke_on_fetch(on_fetch)
+                    catchup_streak += 1
+                    if ok:
+                        backoff_attempt = 0
+                    else:
+                        delay = next_backoff_seconds(backoff_attempt)
+                        backoff_attempt += 1
+                        logger.warning(
+                            "Initial catch-up fetch failed; waiting %.0fs before retry",
+                            delay,
+                        )
+                        if _wait_interruptible(stop_event, delay):
+                            break
 
                     while not stop_event.is_set():
                         if not _wait_until_idle_allowed(stop_event):
@@ -576,6 +624,8 @@ def watcher_loop(
                                     )
                                     need_fetch = True
                             if not need_fetch:
+                                # Clean mailbox → allow IDLE; clear catch-up streak.
+                                catchup_streak = 0
                                 # on_wake is a no-op: fetch only after we drop this connection.
                                 need_fetch = run_idle_session(
                                     client,
@@ -600,9 +650,26 @@ def watcher_loop(
                                 continue
                             break
                         if need_fetch:
-                            on_fetch()
-                            # Only clear backoff after a successful IDLE window that led to fetch.
-                            backoff_attempt = 0
+                            # Pace retries when the previous catch-up left pending UIDs
+                            # (e.g. Gmail auth failure) or this is a repeat after failure.
+                            if catchup_streak > 0:
+                                delay = next_backoff_seconds(catchup_streak - 1)
+                                logger.warning(
+                                    "Catch-up fetch retry delayed %.0fs "
+                                    "(pending mail remains or prior fetch failed)",
+                                    delay,
+                                )
+                                if _wait_interruptible(stop_event, delay):
+                                    break
+                            ok = invoke_on_fetch(on_fetch)
+                            catchup_streak += 1
+                            if ok:
+                                backoff_attempt = 0
+                            else:
+                                # Failed import: keep connection backoff in sync too.
+                                backoff_attempt = max(
+                                    backoff_attempt, catchup_streak - 1
+                                )
                             continue
                         # aborted without fetch (e.g. stop during idle_done path)
                         break
