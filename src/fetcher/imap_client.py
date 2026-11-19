@@ -213,18 +213,124 @@ def delete_and_expunge(
     use_ssl: bool = True,
 ) -> None:
     """Mark message by UID as deleted and expunge (only call after Gmail import succeeded)."""
-    ssl_context = ssl.create_default_context() if use_ssl else None
-    if use_ssl:
-        conn = imaplib.IMAP4_SSL(host, port=port, ssl_context=ssl_context)
-    else:
-        conn = imaplib.IMAP4(host, port=port)
-    try:
-        conn.login(username, password)
-        conn.select(mailbox, readonly=False)
-        conn.uid("STORE", str(uid), "+FLAGS", "\\Deleted")
-        conn.expunge()
-    finally:
+    with ImapImportSession(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        mailbox=mailbox,
+        use_ssl=use_ssl,
+    ) as session:
+        session.delete_uid(uid)
+
+
+class ImapImportSession:
+    """
+    One IMAP login shared for search/fetch/delete.
+
+    Avoids overlapping fetch + delete connections (important when an IDLE watcher
+    already holds a slot on 2-connection ISP accounts).
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        mailbox: str = "INBOX",
+        use_ssl: bool = True,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.mailbox = mailbox
+        self.use_ssl = use_ssl
+        self._conn: imaplib.IMAP4 | None = None
+        self._readonly: bool | None = None
+
+    def __enter__(self) -> "ImapImportSession":
+        ssl_context = ssl.create_default_context() if self.use_ssl else None
+        if self.use_ssl:
+            self._conn = imaplib.IMAP4_SSL(
+                self.host, port=self.port, ssl_context=ssl_context
+            )
+        else:
+            self._conn = imaplib.IMAP4(self.host, port=self.port)
+        self._conn.login(self.username, self.password)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        conn = self._conn
+        self._conn = None
+        self._readonly = None
+        if conn is None:
+            return
         try:
             conn.logout()
         except Exception:  # noqa: BLE001
             pass
+
+    def _require_conn(self) -> imaplib.IMAP4:
+        if self._conn is None:
+            raise RuntimeError("IMAP session is closed")
+        return self._conn
+
+    def _select(self, readonly: bool) -> None:
+        conn = self._require_conn()
+        if self._readonly is readonly:
+            return
+        conn.select(self.mailbox, readonly=readonly)
+        self._readonly = readonly
+
+    def get_uid_validity(self) -> int:
+        conn = self._require_conn()
+        status = conn.status(self.mailbox, "(UIDVALIDITY)")
+        return int(status[1][0].decode().split("UIDVALIDITY")[1].strip(" ()"))
+
+    def search_uids(
+        self,
+        last_processed_uid: int | None = None,
+        since: str | datetime.date | None = None,
+    ) -> list[int]:
+        """SELECT readonly, SEARCH, return sorted UIDs."""
+        self._select(readonly=True)
+        conn = self._require_conn()
+        criteria_parts: list[str] = []
+        if last_processed_uid is not None:
+            criteria_parts.append(f"UID {last_processed_uid + 1}:*")
+        else:
+            criteria_parts.append("UID 1:*")
+        if since is not None:
+            criteria_parts.append(f"SINCE {_format_imap_date(since)}")
+        _, data = conn.uid("SEARCH", None, " ".join(criteria_parts))
+        if not data or not data[0]:
+            return []
+        uids = [int(x) for x in data[0].split()]
+        uids.sort()
+        return uids
+
+    def fetch_uid(self, uid: int, uid_validity: int) -> FetchedMessage | None:
+        """FETCH one message (readonly). Returns None if body missing."""
+        self._select(readonly=True)
+        conn = self._require_conn()
+        _, parts = conn.uid("FETCH", str(uid), "(FLAGS RFC822)")
+        raw = _extract_rfc822(parts)
+        if not raw:
+            return None
+        return FetchedMessage.from_raw(
+            uid, uid_validity, raw, is_seen=_extract_flags_seen(parts)
+        )
+
+    def delete_uid(self, uid: int) -> None:
+        """STORE \\Deleted + EXPUNGE on this connection (writable select)."""
+        self._select(readonly=False)
+        conn = self._require_conn()
+        conn.uid("STORE", str(uid), "+FLAGS", "\\Deleted")
+        conn.expunge()
+        # Next fetch should use readonly again so \Seen is not set by FETCH.
+        self._readonly = None

@@ -128,11 +128,13 @@ def import_message(
     inbox_label_id: str | None = None,
     unread_label_id: str | None = None,
     mark_unread: bool = True,
+    never_mark_spam: bool = True,
 ) -> str:
     """
     Import a single message using users.messages.import.
     Preserves original headers and sets internalDate when possible.
     If mark_unread is False (message was read on ISP), the message is imported as read.
+    If never_mark_spam is True, ignore Gmail's spam classifier for this import.
     Returns Gmail message ID.
     """
     raw = _normalize_from_header(raw)
@@ -152,6 +154,7 @@ def import_message(
         lambda: service.users().messages().import_(
             userId=user_id,
             body=body,
+            neverMarkSpam=never_mark_spam,
         ).execute()
     )
     return msg["id"]

@@ -6,7 +6,10 @@
     "password_env": "IMAP_PASSWORD",
     "mailbox": "INBOX",
     "use_ssl": true,
-    "delete_after_import": true
+    "delete_after_import": true,
+    "never_mark_spam": true,
+    "use_idle": true,
+    "idle_refresh_minutes": 25
   },
   "gmail": {
     "label": "ISP Mail",

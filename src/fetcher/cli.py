@@ -284,6 +284,7 @@ def _write_default_config(dest: Path) -> None:
             "mailbox": "INBOX",
             "use_ssl": True,
             "delete_after_import": True,
+            "never_mark_spam": True,
             "since_date": None,
         },
         # Canonical: gmail_accounts (multi-account). Single-account setups will have one entry.
@@ -318,6 +319,7 @@ def config_wizard_interactive() -> None:
             "mailbox": mailbox,
             "use_ssl": True,
             "delete_after_import": True,
+            "never_mark_spam": True,
             "since_date": None,
         },
         "gmail_accounts": [{"use_label": bool(label), "label": label or "ISP Mail", "credentials_path": cred_path, "token_path": token_path}],

@@ -21,7 +21,7 @@ from .gmail_client import (
     gmail_has_message_with_id,
     import_message,
 )
-from .imap_client import delete_and_expunge, fetch_messages, get_uid_validity
+from .imap_client import ImapImportSession
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,7 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
     delete_after_import = imap_cfg.get("delete_after_import", True)
+    never_mark_spam = bool(imap_cfg.get("never_mark_spam", True))
     since_date = imap_cfg.get("since_date")
     if since_date == "":
         since_date = None
@@ -99,138 +100,174 @@ def run_once(config_path: str | None = None, dry_run: bool = False) -> dict[str,
     state = StateStore(str(db_path))
     state.connect()
 
-    try:
-        uid_validity = get_uid_validity(
-            host=imap_cfg["host"],
-            port=int(imap_cfg.get("port", 993)),
-            username=imap_cfg["username"],
-            password=imap_cfg["password"],
-            mailbox=mailbox,
-            use_ssl=imap_cfg.get("use_ssl", True),
-        )
-    except Exception as e:
-        logger.exception("IMAP connect (UIDVALIDITY) failed: %s", e)
-        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
-
-    last_uid = state.get_last_processed_uid(mailbox, uid_validity)
-    try:
-        uid_validity, messages_iter = fetch_messages(
-            host=imap_cfg["host"],
-            port=int(imap_cfg.get("port", 993)),
-            username=imap_cfg["username"],
-            password=imap_cfg["password"],
-            mailbox=mailbox,
-            use_ssl=imap_cfg.get("use_ssl", True),
-            last_processed_uid=last_uid,
-            since=since_date,
-        )
-    except Exception as e:
-        logger.exception("IMAP fetch failed: %s", e)
-        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
-
     imported = 0
     skipped_duplicate = 0
     deleted = 0
     gmail_contexts: list[tuple[Any, str | None, str, str]] = []
+    uid_validity = 0
 
-    for msg in messages_iter:
-        if state.seen_hash(msg.message_hash):
-            logger.debug("Skipping duplicate (hash): uid=%s", msg.uid)
-            skipped_duplicate += 1
-            if not dry_run and delete_after_import:
-                try:
-                    delete_and_expunge(
-                        imap_cfg["host"],
-                        int(imap_cfg.get("port", 993)),
-                        imap_cfg["username"],
-                        imap_cfg["password"],
-                        mailbox,
-                        msg.uid,
-                        imap_cfg.get("use_ssl", True),
-                    )
-                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-                    deleted += 1
-                except Exception as e:
-                    logger.warning("Delete (duplicate) failed for uid=%s: %s", msg.uid, e)
-            continue
-
-        if dry_run:
-            logger.info("[DRY-RUN] Would import uid=%s (hash=%s)", msg.uid, msg.message_hash[:16])
-            imported += 1
-            continue
-
-        if not gmail_contexts:
+    try:
+        with ImapImportSession(
+            host=imap_cfg["host"],
+            port=int(imap_cfg.get("port", 993)),
+            username=imap_cfg["username"],
+            password=imap_cfg["password"],
+            mailbox=mailbox,
+            use_ssl=imap_cfg.get("use_ssl", True),
+        ) as imap:
             try:
-                gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+                uid_validity = imap.get_uid_validity()
             except Exception as e:
-                logger.exception("Gmail API init failed: %s", e)
+                logger.exception("IMAP connect (UIDVALIDITY) failed: %s", e)
                 return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
-        # Import to all Gmail accounts. Record state when at least one import succeeds; only
-        # delete from ISP when *all* imports succeed. This avoids duplicate imports when a
-        # subset of accounts succeeded but others failed.
-        first_gmail_id: str | None = None
-        all_succeeded = True
-        any_imported = False
-        skip_entire_message = False
-        for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(gmail_contexts):
+            last_uid = state.get_last_processed_uid(mailbox, uid_validity)
             try:
-                label_ids = [label_id] if label_id else []
-                gmail_id = import_message(
-                    service,
-                    USER_ID,
-                    msg.raw,
-                    label_ids=label_ids,
-                    inbox_label_id=inbox_label_id,
-                    unread_label_id=unread_label_id,
-                    mark_unread=True,
-                )
-                any_imported = True
-                if first_gmail_id is None:
-                    first_gmail_id = gmail_id
-                logger.info("Imported uid=%s -> Gmail account %s id=%s", msg.uid, idx + 1, gmail_id)
-            except SkipMessageError as e:
-                logger.warning("Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e)
-                # Message is structurally invalid for Gmail (missing From/Sender/Reply-To). Treat it
-                # as permanently unimportable for *all* accounts: do not record a partial success,
-                # but do advance last_processed_uid so we don't get stuck retrying this UID forever.
-                skip_entire_message = True
-                all_succeeded = False
-                break
+                uids = imap.search_uids(last_processed_uid=last_uid, since=since_date)
             except Exception as e:
-                logger.exception("Gmail import failed for uid=%s account %s: %s", msg.uid, idx + 1, e)
-                all_succeeded = False
-                break
+                logger.exception("IMAP fetch failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
-        if skip_entire_message:
-            state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-            # Do not record_import and do not delete from ISP; the message remains only on ISP.
-            continue
+            for uid in uids:
+                try:
+                    msg = imap.fetch_uid(uid, uid_validity)
+                except Exception as e:
+                    logger.exception("IMAP FETCH failed for uid=%s: %s", uid, e)
+                    return {
+                        "error": str(e),
+                        "imported": imported,
+                        "skipped_duplicate": skipped_duplicate,
+                        "deleted": deleted,
+                    }
+                if msg is None:
+                    # Do not skip ahead: later duplicate handling must not advance
+                    # the watermark past an unreadable UID.
+                    logger.warning(
+                        "IMAP FETCH returned no body for uid=%s; stopping this run to retry later",
+                        uid,
+                    )
+                    break
 
-        if not any_imported or first_gmail_id is None:
-            # No successful import this run; do not record state or delete from ISP.
-            # Next run will retry for all accounts.
-            continue
+                if state.seen_hash(msg.message_hash):
+                    logger.debug("Skipping duplicate (hash): uid=%s", msg.uid)
+                    skipped_duplicate += 1
+                    if not dry_run:
+                        # Advance watermark even when not deleting so IDLE/pre-IDLE
+                        # checks do not keep treating this UID as pending forever.
+                        # Safe only because we stop the run on earlier retryable failures.
+                        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                        if delete_after_import:
+                            try:
+                                imap.delete_uid(msg.uid)
+                                deleted += 1
+                            except Exception as e:
+                                logger.warning(
+                                    "Delete (duplicate) failed for uid=%s: %s",
+                                    msg.uid,
+                                    e,
+                                )
+                    continue
 
-        state.record_import(msg.message_hash, first_gmail_id, mailbox, uid_validity, msg.uid)
-        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-        imported += 1
+                if dry_run:
+                    logger.info(
+                        "[DRY-RUN] Would import uid=%s (hash=%s)",
+                        msg.uid,
+                        msg.message_hash[:16],
+                    )
+                    imported += 1
+                    continue
 
-        if delete_after_import and all_succeeded:
-            try:
-                delete_and_expunge(
-                    imap_cfg["host"],
-                    int(imap_cfg.get("port", 993)),
-                    imap_cfg["username"],
-                    imap_cfg["password"],
-                    mailbox,
-                    msg.uid,
-                    imap_cfg.get("use_ssl", True),
+                if not gmail_contexts:
+                    try:
+                        gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+                    except Exception as e:
+                        logger.exception("Gmail API init failed: %s", e)
+                        return {
+                            "error": str(e),
+                            "imported": 0,
+                            "skipped_duplicate": 0,
+                            "deleted": 0,
+                        }
+
+                # Import to all Gmail accounts. Record state when at least one import succeeds;
+                # only delete from ISP when *all* imports succeed.
+                first_gmail_id: str | None = None
+                all_succeeded = True
+                any_imported = False
+                skip_entire_message = False
+                for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(
+                    gmail_contexts
+                ):
+                    try:
+                        label_ids = [label_id] if label_id else []
+                        gmail_id = import_message(
+                            service,
+                            USER_ID,
+                            msg.raw,
+                            label_ids=label_ids,
+                            inbox_label_id=inbox_label_id,
+                            unread_label_id=unread_label_id,
+                            mark_unread=True,
+                            never_mark_spam=never_mark_spam,
+                        )
+                        any_imported = True
+                        if first_gmail_id is None:
+                            first_gmail_id = gmail_id
+                        logger.info(
+                            "Imported uid=%s -> Gmail account %s id=%s",
+                            msg.uid,
+                            idx + 1,
+                            gmail_id,
+                        )
+                    except SkipMessageError as e:
+                        logger.warning(
+                            "Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e
+                        )
+                        skip_entire_message = True
+                        all_succeeded = False
+                        break
+                    except Exception as e:
+                        logger.exception(
+                            "Gmail import failed for uid=%s account %s: %s",
+                            msg.uid,
+                            idx + 1,
+                            e,
+                        )
+                        all_succeeded = False
+                        break
+
+                if skip_entire_message:
+                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                    continue
+
+                if not any_imported or first_gmail_id is None:
+                    # Retryable failure: stop so a later duplicate cannot advance the
+                    # watermark past this undelivered UID.
+                    logger.warning(
+                        "Stopping fetch run after retryable import failure for uid=%s",
+                        msg.uid,
+                    )
+                    break
+
+                state.record_import(
+                    msg.message_hash, first_gmail_id, mailbox, uid_validity, msg.uid
                 )
-                deleted += 1
-            except Exception as e:
-                # Count only successful deletions; failures are logged but not included.
-                logger.exception("Delete failed for uid=%s (already in Gmail): %s", msg.uid, e)
+                state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                imported += 1
+
+                if delete_after_import and all_succeeded:
+                    try:
+                        imap.delete_uid(msg.uid)
+                        deleted += 1
+                    except Exception as e:
+                        logger.exception(
+                            "Delete failed for uid=%s (already in Gmail): %s",
+                            msg.uid,
+                            e,
+                        )
+    except Exception as e:
+        logger.exception("IMAP session failed: %s", e)
+        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     last_fetch = state.get_last_fetch_time(mailbox, uid_validity)
     state.close()
@@ -270,6 +307,7 @@ def run_copy_all(
     if not db_path.is_absolute():
         db_path = config_dir / db_path
     mailbox = imap_cfg.get("mailbox", "INBOX")
+    never_mark_spam = bool(imap_cfg.get("never_mark_spam", True))
     since_date = imap_cfg.get("since_date")
     if since_date == "":
         since_date = None
@@ -277,185 +315,223 @@ def run_copy_all(
     state = StateStore(str(db_path))
     state.connect()
 
-    try:
-        uid_validity = get_uid_validity(
-            host=imap_cfg["host"],
-            port=int(imap_cfg.get("port", 993)),
-            username=imap_cfg["username"],
-            password=imap_cfg["password"],
-            mailbox=mailbox,
-            use_ssl=imap_cfg.get("use_ssl", True),
-        )
-    except Exception as e:
-        logger.exception("IMAP connect (UIDVALIDITY) failed: %s", e)
-        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
-
-    try:
-        uid_validity, messages_iter = fetch_messages(
-            host=imap_cfg["host"],
-            port=int(imap_cfg.get("port", 993)),
-            username=imap_cfg["username"],
-            password=imap_cfg["password"],
-            mailbox=mailbox,
-            use_ssl=imap_cfg.get("use_ssl", True),
-            last_processed_uid=None,
-            since=since_date,
-        )
-    except Exception as e:
-        logger.exception("IMAP fetch failed: %s", e)
-        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
-
     imported = 0
     skipped_duplicate = 0
     deleted = 0
     gmail_contexts: list[tuple[Any, str | None, str, str]] = []
+    uid_validity = 0
 
-    for msg in messages_iter:
-        # Copy-all is also used as a "repair" tool. With multiple Gmail accounts, we must not
-        # skip a message just because one account already has it; we should import to the missing
-        # accounts. Therefore:
-        # - For single-account setups, we keep the existing hash-based dedupe fast-path.
-        # - For multi-account setups, we rely on per-account Message-ID checks when available.
-        # IMPORTANT: use gmail_accounts length here (not gmail_contexts) so behavior is correct
-        # even in dry-run, where gmail_contexts is intentionally empty.
-        if len(gmail_accounts) <= 1 and state.seen_hash(msg.message_hash):
-            logger.debug("Copy-all: skipping duplicate (hash): uid=%s", msg.uid)
-            skipped_duplicate += 1
-            if not dry_run and delete_after_import:
-                try:
-                    delete_and_expunge(
-                        imap_cfg["host"],
-                        int(imap_cfg.get("port", 993)),
-                        imap_cfg["username"],
-                        imap_cfg["password"],
-                        mailbox,
-                        msg.uid,
-                        imap_cfg.get("use_ssl", True),
-                    )
-                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-                    deleted += 1
-                except Exception as e:
-                    logger.warning("Delete (duplicate) failed for uid=%s: %s", msg.uid, e)
-            continue
-
-        if dry_run:
-            logger.info(
-                "[DRY-RUN] Copy-all would import uid=%s (hash=%s)",
-                msg.uid,
-                msg.message_hash[:16],
-            )
-            imported += 1
-            continue
-
-        if not gmail_contexts:
+    try:
+        with ImapImportSession(
+            host=imap_cfg["host"],
+            port=int(imap_cfg.get("port", 993)),
+            username=imap_cfg["username"],
+            password=imap_cfg["password"],
+            mailbox=mailbox,
+            use_ssl=imap_cfg.get("use_ssl", True),
+        ) as imap:
             try:
-                gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+                uid_validity = imap.get_uid_validity()
             except Exception as e:
-                logger.exception("Gmail API init failed: %s", e)
+                logger.exception("IMAP connect (UIDVALIDITY) failed: %s", e)
                 return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
-        message_id_header = _parse_message_id_from_raw(msg.raw)
-
-        first_gmail_id: str | None = None
-        all_succeeded = True
-        any_imported = False
-        all_already_had = True
-
-        for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(gmail_contexts):
             try:
-                already_here = False
-                if message_id_header:
-                    already_here = gmail_has_message_with_id(service, USER_ID, message_id_header)
-                if already_here:
-                    logger.debug("Copy-all: uid=%s already in Gmail account %s (Message-ID)", msg.uid, idx + 1)
-                else:
-                    all_already_had = False
-                    label_ids = [label_id] if label_id else []
-                    gmail_id = import_message(
-                        service,
-                        USER_ID,
-                        msg.raw,
-                        label_ids=label_ids,
-                        inbox_label_id=inbox_label_id,
-                        unread_label_id=unread_label_id,
-                        mark_unread=not msg.is_seen,
-                    )
-                    any_imported = True
-                    if first_gmail_id is None:
-                        first_gmail_id = gmail_id
-                    logger.info(
-                        "Copy-all imported uid=%s -> Gmail account %s id=%s",
-                        msg.uid,
-                        idx + 1,
-                        gmail_id,
-                    )
-            except SkipMessageError as e:
-                logger.warning("Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e)
-                all_succeeded = False
-                break
+                uids = imap.search_uids(last_processed_uid=None, since=since_date)
             except Exception as e:
-                logger.exception("Gmail import failed for uid=%s account %s: %s", msg.uid, idx + 1, e)
-                all_succeeded = False
-                break
+                logger.exception("IMAP fetch failed: %s", e)
+                return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
-        if not all_succeeded:
-            continue
-
-        if all_already_had and message_id_header:
-            skipped_duplicate += 1
-            # Even when every Gmail account already has the message, we still consider it "handled"
-            # for copy-all bookkeeping so we don't re-process it on subsequent copy-all runs.
-            state.record_import(
-                msg.message_hash,
-                "already-present",
-                mailbox,
-                uid_validity,
-                msg.uid,
-            )
-            state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-            if delete_after_import:
+            for uid in uids:
                 try:
-                    delete_and_expunge(
-                        imap_cfg["host"],
-                        int(imap_cfg.get("port", 993)),
-                        imap_cfg["username"],
-                        imap_cfg["password"],
-                        mailbox,
-                        msg.uid,
-                        imap_cfg.get("use_ssl", True),
-                    )
-                    deleted += 1
+                    msg = imap.fetch_uid(uid, uid_validity)
                 except Exception as e:
-                    logger.warning("Delete (already in Gmail) failed for uid=%s: %s", msg.uid, e)
-            continue
+                    logger.exception("IMAP FETCH failed for uid=%s: %s", uid, e)
+                    return {
+                        "error": str(e),
+                        "imported": imported,
+                        "skipped_duplicate": skipped_duplicate,
+                        "deleted": deleted,
+                    }
+                if msg is None:
+                    logger.warning(
+                        "IMAP FETCH returned no body for uid=%s; stopping copy-all to retry later",
+                        uid,
+                    )
+                    break
 
-        if not any_imported and first_gmail_id is None:
-            # No Message-ID to check, and no import happened (shouldn't occur); be safe.
-            continue
+                # Copy-all is also used as a "repair" tool. With multiple Gmail accounts, we must not
+                # skip a message just because one account already has it; we should import to the missing
+                # accounts. Therefore:
+                # - For single-account setups, we keep the existing hash-based dedupe fast-path.
+                # - For multi-account setups, we rely on per-account Message-ID checks when available.
+                # IMPORTANT: use gmail_accounts length here (not gmail_contexts) so behavior is correct
+                # even in dry-run, where gmail_contexts is intentionally empty.
+                if len(gmail_accounts) <= 1 and state.seen_hash(msg.message_hash):
+                    logger.debug("Copy-all: skipping duplicate (hash): uid=%s", msg.uid)
+                    skipped_duplicate += 1
+                    if not dry_run:
+                        # Safe only because we stop the run on earlier retryable failures.
+                        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                        if delete_after_import:
+                            try:
+                                imap.delete_uid(msg.uid)
+                                deleted += 1
+                            except Exception as e:
+                                logger.warning(
+                                    "Delete (duplicate) failed for uid=%s: %s",
+                                    msg.uid,
+                                    e,
+                                )
+                    continue
 
-        # Consider the message handled when every account either already had it (by Message-ID)
-        # or we successfully imported it. Record a single hash marker for copy-all bookkeeping.
-        state.record_import(msg.message_hash, first_gmail_id or "already-present", mailbox, uid_validity, msg.uid)
-        state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
-        imported += 1
+                if dry_run:
+                    logger.info(
+                        "[DRY-RUN] Copy-all would import uid=%s (hash=%s)",
+                        msg.uid,
+                        msg.message_hash[:16],
+                    )
+                    imported += 1
+                    continue
 
-        if delete_after_import:
-            try:
-                delete_and_expunge(
-                    imap_cfg["host"],
-                    int(imap_cfg.get("port", 993)),
-                    imap_cfg["username"],
-                    imap_cfg["password"],
+                if not gmail_contexts:
+                    try:
+                        gmail_contexts = _build_gmail_contexts(gmail_accounts, config_dir)
+                    except Exception as e:
+                        logger.exception("Gmail API init failed: %s", e)
+                        return {
+                            "error": str(e),
+                            "imported": 0,
+                            "skipped_duplicate": 0,
+                            "deleted": 0,
+                        }
+
+                message_id_header = _parse_message_id_from_raw(msg.raw)
+
+                first_gmail_id: str | None = None
+                all_succeeded = True
+                any_imported = False
+                all_already_had = True
+                skip_entire_message = False
+
+                for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(
+                    gmail_contexts
+                ):
+                    try:
+                        already_here = False
+                        if message_id_header:
+                            already_here = gmail_has_message_with_id(
+                                service, USER_ID, message_id_header
+                            )
+                        if already_here:
+                            logger.debug(
+                                "Copy-all: uid=%s already in Gmail account %s (Message-ID)",
+                                msg.uid,
+                                idx + 1,
+                            )
+                        else:
+                            all_already_had = False
+                            label_ids = [label_id] if label_id else []
+                            gmail_id = import_message(
+                                service,
+                                USER_ID,
+                                msg.raw,
+                                label_ids=label_ids,
+                                inbox_label_id=inbox_label_id,
+                                unread_label_id=unread_label_id,
+                                mark_unread=not msg.is_seen,
+                                never_mark_spam=never_mark_spam,
+                            )
+                            any_imported = True
+                            if first_gmail_id is None:
+                                first_gmail_id = gmail_id
+                            logger.info(
+                                "Copy-all imported uid=%s -> Gmail account %s id=%s",
+                                msg.uid,
+                                idx + 1,
+                                gmail_id,
+                            )
+                    except SkipMessageError as e:
+                        logger.warning(
+                            "Skipping uid=%s (no From/Sender/Reply-To): %s", msg.uid, e
+                        )
+                        skip_entire_message = True
+                        all_succeeded = False
+                        break
+                    except Exception as e:
+                        logger.exception(
+                            "Gmail import failed for uid=%s account %s: %s",
+                            msg.uid,
+                            idx + 1,
+                            e,
+                        )
+                        all_succeeded = False
+                        break
+
+                if skip_entire_message:
+                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                    continue
+
+                if not all_succeeded:
+                    # Retryable failure: do not let later duplicates advance past this UID.
+                    logger.warning(
+                        "Stopping copy-all after import failure for uid=%s",
+                        msg.uid,
+                    )
+                    break
+
+                if all_already_had and message_id_header:
+                    skipped_duplicate += 1
+                    state.record_import(
+                        msg.message_hash,
+                        "already-present",
+                        mailbox,
+                        uid_validity,
+                        msg.uid,
+                    )
+                    state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                    if delete_after_import:
+                        try:
+                            imap.delete_uid(msg.uid)
+                            deleted += 1
+                        except Exception as e:
+                            logger.warning(
+                                "Delete (already in Gmail) failed for uid=%s: %s",
+                                msg.uid,
+                                e,
+                            )
+                    continue
+
+                if not any_imported and first_gmail_id is None:
+                    logger.warning(
+                        "Stopping copy-all after empty import result for uid=%s",
+                        msg.uid,
+                    )
+                    break
+
+                state.record_import(
+                    msg.message_hash,
+                    first_gmail_id or "already-present",
                     mailbox,
+                    uid_validity,
                     msg.uid,
-                    imap_cfg.get("use_ssl", True),
                 )
-                deleted += 1
-            except Exception as e:
-                # Only count successful deletions; failures are logged but not included.
-                logger.exception(
-                    "Delete failed for uid=%s (already in Gmail): %s", msg.uid, e
-                )
+                state.set_last_processed_uid(mailbox, uid_validity, msg.uid)
+                imported += 1
+
+                if delete_after_import:
+                    try:
+                        imap.delete_uid(msg.uid)
+                        deleted += 1
+                    except Exception as e:
+                        logger.exception(
+                            "Delete failed for uid=%s (already in Gmail): %s",
+                            msg.uid,
+                            e,
+                        )
+    except Exception as e:
+        logger.exception("IMAP session failed: %s", e)
+        return {"error": str(e), "imported": 0, "skipped_duplicate": 0, "deleted": 0}
 
     last_fetch = state.get_last_fetch_time(mailbox, uid_validity)
     state.close()

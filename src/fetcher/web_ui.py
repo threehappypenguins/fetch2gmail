@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import threading
-import time
 import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,84 +25,123 @@ import imaplib
 from .config import get_config_path, get_gmail_accounts, load_config
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
+from .idle_watcher import pause_idle_connection, watcher_loop
 from .imap_client import get_uid_validity
 from .log_buffer import get_recent_logs, install_log_buffer
 from .run import run_once, run_copy_all, setup_logging
+from .state import StateStore
 from .ui_auth import create_ui_auth, load_ui_auth, verify_ui_auth
 
 logger = logging.getLogger(__name__)
 
-# Prevents multiple "Copy all" runs from overlapping (manual button only).
-_copy_all_lock = threading.Lock()
+# Prevents overlapping imports (IDLE wake, poll fallback, manual fetch, copy-all).
+_fetch_lock = threading.Lock()
+# Back-compat alias used by copy-all path.
+_copy_all_lock = _fetch_lock
 
 
-def _poller_loop(stop_event: threading.Event) -> None:
-    """Background thread: every poll_interval_minutes run a fetch when config exists.
-    Re-reads config every 10s so changing poll_interval_minutes in the UI takes effect without restart.
-    """
-    last_run_at: float | None = None
-    while not stop_event.is_set():
-        try:
-            if not _config_exists():
-                stop_event.wait(timeout=60)
-                continue
-            path = _get_config_path()
-            cfg = load_config(path, resolve_password=False)
-            interval_minutes = max(1, int(cfg.get("poll_interval_minutes", 5)))
-            interval_seconds = interval_minutes * 60
-        except Exception as e:
-            logger.warning("Poller could not load config: %s", e)
-            stop_event.wait(timeout=60)
-            continue
-        now = time.monotonic()
-        if last_run_at is None:
-            # First run: short delay (30s) so we fetch soon after startup
-            next_run_at = now + 30
-        else:
-            next_run_at = last_run_at + interval_seconds
-        # Wait in 10s chunks and re-read config each wake so interval changes apply without restart
-        while not stop_event.is_set() and time.monotonic() < next_run_at:
-            stop_event.wait(timeout=10)
-            # Re-read interval so UI changes take effect within ~10s
-            try:
-                if _config_exists() and last_run_at is not None:
-                    cfg = load_config(_get_config_path(), resolve_password=False)
-                    interval_minutes = max(1, int(cfg.get("poll_interval_minutes", 5)))
-                    interval_seconds = interval_minutes * 60
-                    next_run_at = last_run_at + interval_seconds
-            except Exception:
-                pass
-        if stop_event.is_set():
-            break
-        last_run_at = time.monotonic()
-        try:
-            setup_logging()
-            install_log_buffer()
-            result = run_once(config_path=str(path), dry_run=False)
-            if result.get("error"):
-                logger.warning("Background fetch error: %s", result["error"])
-            else:
-                logger.info(
-                    "Background fetch: imported=%s skipped=%s deleted=%s",
-                    result.get("imported", 0),
-                    result.get("skipped_duplicate", 0),
-                    result.get("deleted", 0),
-                )
-        except ValueError as e:
-            logger.warning("Background fetch skipped: %s", e)
-        except Exception as e:
-            logger.exception("Background fetch failed: %s", e)
+def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
+    """Return IMAP + poll/IDLE settings for the watcher, or None if not ready."""
+    if not _config_exists():
+        return None
+    path = _get_config_path()
+    cfg = load_config(path, resolve_password=True)
+    imap = cfg.get("imap") or {}
+    if not imap.get("host") or not imap.get("username") or not imap.get("password"):
+        return None
+    since_date = imap.get("since_date")
+    if since_date == "":
+        since_date = None
+    return {
+        "host": imap["host"],
+        "port": int(imap.get("port", 993)),
+        "username": imap["username"],
+        "password": imap["password"],
+        "mailbox": imap.get("mailbox") or "INBOX",
+        "use_ssl": bool(imap.get("use_ssl", True)),
+        "use_idle": bool(imap.get("use_idle", True)),
+        "idle_refresh_minutes": max(1, int(imap.get("idle_refresh_minutes", 25))),
+        "poll_interval_minutes": max(1, int(cfg.get("poll_interval_minutes", 5))),
+        "since_date": since_date,
+        "state_db_path": str((cfg.get("state") or {}).get("db_path", "state.db")),
+        "config_dir": str(path.resolve().parent),
+    }
+
+
+def _watcher_last_processed_uid(mailbox: str, uid_validity: int) -> int | None:
+    """Read last_processed_uid from state.db for pre-IDLE pending-mail checks."""
+    if not _config_exists():
+        return None
+    path = _get_config_path()
+    cfg = load_config(path, resolve_password=False)
+    config_dir = path.resolve().parent
+    raw_db = (cfg.get("state") or {}).get("db_path", "state.db")
+    db_path = Path(raw_db)
+    if not db_path.is_absolute():
+        db_path = config_dir / db_path
+    state = StateStore(str(db_path))
+    try:
+        state.connect()
+        return state.get_last_processed_uid(mailbox, uid_validity)
+    finally:
+        state.close()
+
+
+def _run_once_locked(config_path: str, dry_run: bool = False) -> dict[str, Any]:
+    """Run one fetch cycle under the shared fetch lock (IDLE connection paused)."""
+    with _fetch_lock:
+        with pause_idle_connection():
+            return run_once(config_path=config_path, dry_run=dry_run)
+
+
+def _watcher_on_fetch() -> bool:
+    """Callback for IDLE/poll wakes: run import once; return True on success."""
+    try:
+        path = _get_config_path()
+        setup_logging()
+        install_log_buffer()
+        result = _run_once_locked(config_path=str(path), dry_run=False)
+        if result.get("error"):
+            logger.warning("Background fetch error: %s", result["error"])
+            return False
+        logger.info(
+            "Background fetch: imported=%s skipped=%s deleted=%s",
+            result.get("imported", 0),
+            result.get("skipped_duplicate", 0),
+            result.get("deleted", 0),
+        )
+        return True
+    except ValueError as e:
+        logger.warning("Background fetch skipped: %s", e)
+        return False
+    except Exception as e:
+        logger.exception("Background fetch failed: %s", e)
+        return False
+
+
+def _watcher_thread_main(stop_event: threading.Event) -> None:
+    """Background thread: IMAP IDLE with polling fallback."""
+    watcher_loop(
+        stop_event,
+        load_imap_settings=_load_imap_settings_for_watcher,
+        on_fetch=_watcher_on_fetch,
+        get_last_processed_uid=_watcher_last_processed_uid,
+    )
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     stop_event = threading.Event()
-    poller = threading.Thread(target=_poller_loop, args=(stop_event,), daemon=True)
-    poller.start()
-    logger.info("Background poller started (interval from config poll_interval_minutes)")
+    watcher = threading.Thread(
+        target=_watcher_thread_main, args=(stop_event,), daemon=True
+    )
+    watcher.start()
+    logger.info(
+        "Background IMAP watcher started (IDLE when supported; else poll_interval_minutes)"
+    )
     yield
     stop_event.set()
-    poller.join(timeout=15)
+    watcher.join(timeout=20)
 
 
 app = FastAPI(title="Fetch2Gmail", description="IMAP to Gmail import service", lifespan=_lifespan)
@@ -229,6 +267,9 @@ class ImapConfigSafe(BaseModel):
     use_ssl: bool
     delete_after_import: bool
     since_date: str | None = None
+    use_idle: bool = True
+    idle_refresh_minutes: int = 25
+    never_mark_spam: bool = True
 
 
 class GmailConfigSafe(BaseModel):
@@ -506,6 +547,9 @@ def api_config(request: Request) -> ConfigResponse:
             use_ssl=imap.get("use_ssl", True),
             delete_after_import=imap.get("delete_after_import", True),
             since_date=imap.get("since_date"),
+            use_idle=bool(imap.get("use_idle", True)),
+            idle_refresh_minutes=max(1, int(imap.get("idle_refresh_minutes", 25))),
+            never_mark_spam=bool(imap.get("never_mark_spam", True)),
         ),
         gmail=GmailConfigSafe(
             use_label=gmail.get("use_label") if "use_label" in gmail else bool((gmail.get("label") or "").strip()),
@@ -537,6 +581,9 @@ class ConfigUpdate(BaseModel):
     imap_since_date: str | None = None
     imap_password: str | None = None  # stored in .env, not in config
     delete_after_import: bool | None = None
+    never_mark_spam: bool | None = None
+    imap_use_idle: bool | None = None
+    imap_idle_refresh_minutes: int | None = None
     gmail_use_label: bool | None = None
     gmail_label: str | None = None
     gmail_accounts: list[GmailAccountSafe] | None = None
@@ -595,6 +642,9 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
             "since_date": body.imap_since_date,
             "use_ssl": body.imap_use_ssl,
             "delete_after_import": body.delete_after_import,
+            "never_mark_spam": True,
+            "use_idle": True,
+            "idle_refresh_minutes": 25,
         },
         # Canonical: gmail_accounts. Keep legacy readers working via get_gmail_accounts().
         "gmail_accounts": [
@@ -673,6 +723,14 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         imap["use_ssl"] = update.imap_use_ssl
     if update.delete_after_import is not None:
         cfg.setdefault("imap", {})["delete_after_import"] = update.delete_after_import
+    if update.never_mark_spam is not None:
+        cfg.setdefault("imap", {})["never_mark_spam"] = bool(update.never_mark_spam)
+    if update.imap_use_idle is not None:
+        cfg.setdefault("imap", {})["use_idle"] = bool(update.imap_use_idle)
+    if update.imap_idle_refresh_minutes is not None:
+        cfg.setdefault("imap", {})["idle_refresh_minutes"] = max(
+            1, int(update.imap_idle_refresh_minutes)
+        )
     # Gmail accounts
     if update.gmail_accounts is not None:
         # Replace full list from UI (canonical).
@@ -812,7 +870,7 @@ def api_fetch(request: Request, dry_run: bool = False) -> dict[str, Any]:
     setup_logging()
     install_log_buffer()
     try:
-        result = run_once(config_path=str(_get_config_path()), dry_run=dry_run)
+        result = _run_once_locked(config_path=str(_get_config_path()), dry_run=dry_run)
         return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -828,12 +886,13 @@ def api_fetch_copy_all(request: Request, body: CopyAllBody) -> dict[str, Any]:
     setup_logging()
     install_log_buffer()
     try:
-        with _copy_all_lock:
-            result = run_copy_all(
-                config_path=str(_get_config_path()),
-                delete_after_import=body.delete_after,
-                dry_run=False,
-            )
+        with _fetch_lock:
+            with pause_idle_connection():
+                result = run_copy_all(
+                    config_path=str(_get_config_path()),
+                    delete_after_import=body.delete_after,
+                    dry_run=False,
+                )
         return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1017,9 +1076,16 @@ _HTML_PAGE = """
     <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Mailbox is the IMAP folder to fetch from. <strong>INBOX</strong> = main inbox where new mail arrives.</p>
     <label>Only fetch mail on or after <input id="imap_since_date" type="date"></label>
     <label style="margin-top:1rem;"><input type="checkbox" id="delete_after_import"> Delete emails from ISP after importing to Gmail</label>
+    <label><input type="checkbox" id="never_mark_spam"> Never mark imported mail as spam</label>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Tells Gmail to ignore its spam classifier on API import (recommended for ISP→Gmail forwarding).</p>
     <label><input type="checkbox" id="gmail_use_label"> Add a Gmail label to imported mail</label>
     <div id="gmail_label_row" style="display:none;"><label>Label name <input id="gmail_label" type="text" placeholder="e.g. ISP Mail"></label></div>
-    <label>Poll interval (minutes) <input id="poll_interval" type="number"></label>
+    <label style="margin-top:1rem;"><input type="checkbox" id="imap_use_idle"> Use IMAP IDLE (realtime) when the server supports it</label>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">If the server does not advertise IDLE, the app falls back to the poll interval below.</p>
+    <label>IDLE refresh (minutes) <input id="idle_refresh" type="number" min="1" title="Re-enter IDLE with NOOP before the ~29 minute server timeout."></label>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">RFC 2177: renew IDLE before ~29 minutes (default 25). Used only when IDLE is active.</p>
+    <label>Poll interval (minutes) <input id="poll_interval" type="number" min="1"></label>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Used when IDLE is unavailable or disabled.</p>
     <label>State DB path <input id="state_db" type="text"></label>
     <button type="button" id="btnSave">Save config</button>
   </section>
@@ -1180,6 +1246,9 @@ _APP_JS = r"""
       document.getElementById('imap_mailbox').value = c.imap.mailbox;
       document.getElementById('imap_since_date').value = c.imap.since_date || '';
       document.getElementById('delete_after_import').checked = c.imap.delete_after_import;
+      document.getElementById('never_mark_spam').checked = c.imap.never_mark_spam !== false;
+      document.getElementById('imap_use_idle').checked = c.imap.use_idle !== false;
+      document.getElementById('idle_refresh').value = c.imap.idle_refresh_minutes || 25;
       document.getElementById('gmail_use_label').checked = c.gmail.use_label;
       document.getElementById('gmail_label_row').style.display = c.gmail.use_label ? 'block' : 'none';
       document.getElementById('gmail_label').value = c.gmail.label;
@@ -1379,6 +1448,9 @@ _APP_JS = r"""
       imap_mailbox: document.getElementById('imap_mailbox').value,
       imap_since_date: document.getElementById('imap_since_date').value || null,
       delete_after_import: document.getElementById('delete_after_import').checked,
+      never_mark_spam: document.getElementById('never_mark_spam').checked,
+      imap_use_idle: document.getElementById('imap_use_idle').checked,
+      imap_idle_refresh_minutes: parseInt(document.getElementById('idle_refresh').value, 10),
       gmail_use_label: document.getElementById('gmail_use_label').checked,
       gmail_label: document.getElementById('gmail_label').value,
       poll_interval_minutes: parseInt(document.getElementById('poll_interval').value, 10),
