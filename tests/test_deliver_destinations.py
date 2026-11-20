@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from fetcher.run import _deliver_to_gmail_destinations
+from fetcher.run import (
+    _deliver_to_gmail_destinations,
+    gmail_destination_identity,
+)
 from fetcher.state import StateStore
 
 
-def _ctx(dest: str = "token.json"):
+def _ctx(dest: str = "gmail:a@example.com"):
     return (MagicMock(name="service"), "LBL", "INBOX", "UNREAD", dest)
 
 
@@ -23,7 +28,7 @@ def test_imports_missing_destination_even_if_other_already_has(mock_has, mock_im
     # Dest 0 already has it; dest 1 does not — must import to dest 1, not treat as skip-all.
     mock_has.side_effect = [True, False]
     result = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx("token.json"), _ctx("token2.json")],
+        gmail_contexts=[_ctx("gmail:a@example.com"), _ctx("gmail:b@example.com")],
         raw=RAW,
         uid=10,
         account_id="isp1",
@@ -41,7 +46,7 @@ def test_imports_missing_destination_even_if_other_already_has(mock_has, mock_im
 @patch("fetcher.run.gmail_has_message_with_id", return_value=True)
 def test_all_destinations_already_had(mock_has, mock_import):
     result = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx(), _ctx("token2.json")],
+        gmail_contexts=[_ctx(), _ctx("gmail:b@example.com")],
         raw=RAW,
         uid=10,
         account_id="isp1",
@@ -60,7 +65,7 @@ def test_all_destinations_already_had(mock_has, mock_import):
 def test_partial_failure_does_not_claim_success(mock_has, mock_import):
     mock_import.side_effect = [Exception("boom")]
     result = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx(), _ctx("token2.json")],
+        gmail_contexts=[_ctx(), _ctx("gmail:b@example.com")],
         raw=RAW,
         uid=10,
         account_id="isp1",
@@ -94,10 +99,10 @@ def test_without_message_id_imports_when_no_hash_delivery(mock_has, mock_import)
 def test_hash_delivery_skips_known_dest_imports_new_dest(mock_has, mock_import, tmp_path):
     store = StateStore(tmp_path / "state.db")
     store.connect()
-    store.record_hash_delivery(HASH, "token.json", "gid-old", account_id="isp1")
+    store.record_hash_delivery(HASH, "gmail:a@example.com", "gid-old", account_id="isp1")
 
     result = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx("token.json"), _ctx("token2.json")],
+        gmail_contexts=[_ctx("gmail:a@example.com"), _ctx("gmail:b@example.com")],
         raw=RAW_NO_MID,
         uid=10,
         account_id="isp1",
@@ -110,8 +115,8 @@ def test_hash_delivery_skips_known_dest_imports_new_dest(mock_has, mock_import, 
     assert result.all_already_had is False
     assert result.any_imported is True
     assert mock_import.call_count == 1
-    assert store.has_delivered_hash_to(HASH, "token.json", account_id="isp1")
-    assert store.has_delivered_hash_to(HASH, "token2.json", account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, "gmail:a@example.com", account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, "gmail:b@example.com", account_id="isp1")
     store.close()
 
 
@@ -122,10 +127,10 @@ def test_hash_delivery_makes_retry_without_message_id_idempotent(
 ):
     store = StateStore(tmp_path / "state.db")
     store.connect()
-    store.record_hash_delivery(HASH, "token.json", "gid", account_id="isp1")
+    store.record_hash_delivery(HASH, "gmail:a@example.com", "gid", account_id="isp1")
 
     result = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx("token.json")],
+        gmail_contexts=[_ctx("gmail:a@example.com")],
         raw=RAW_NO_MID,
         uid=10,
         account_id="isp1",
@@ -148,7 +153,7 @@ def test_partial_success_records_dest_so_retry_skips_it(mock_has, mock_import, t
     mock_import.side_effect = ["gid-a", Exception("boom")]
 
     first = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx("token.json"), _ctx("token2.json")],
+        gmail_contexts=[_ctx("gmail:a@example.com"), _ctx("gmail:b@example.com")],
         raw=RAW_NO_MID,
         uid=10,
         account_id="isp1",
@@ -158,13 +163,13 @@ def test_partial_success_records_dest_so_retry_skips_it(mock_has, mock_import, t
         state=store,
     )
     assert first.all_succeeded is False
-    assert store.has_delivered_hash_to(HASH, "token.json", account_id="isp1")
-    assert not store.has_delivered_hash_to(HASH, "token2.json", account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, "gmail:a@example.com", account_id="isp1")
+    assert not store.has_delivered_hash_to(HASH, "gmail:b@example.com", account_id="isp1")
 
     mock_import.reset_mock()
     mock_import.side_effect = ["gid-b"]
     second = _deliver_to_gmail_destinations(
-        gmail_contexts=[_ctx("token.json"), _ctx("token2.json")],
+        gmail_contexts=[_ctx("gmail:a@example.com"), _ctx("gmail:b@example.com")],
         raw=RAW_NO_MID,
         uid=10,
         account_id="isp1",
@@ -176,5 +181,73 @@ def test_partial_success_records_dest_so_retry_skips_it(mock_has, mock_import, t
     assert second.all_succeeded is True
     assert second.any_imported is True
     assert mock_import.call_count == 1
-    assert store.has_delivered_hash_to(HASH, "token2.json", account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, "gmail:b@example.com", account_id="isp1")
     store.close()
+
+
+def test_gmail_destination_identity_uses_email_not_filename():
+    service = MagicMock()
+    service.users().getProfile().execute.return_value = {
+        "emailAddress": "New.User@Example.com"
+    }
+    assert (
+        gmail_destination_identity(service, Path("token2.json"))
+        == "gmail:new.user@example.com"
+    )
+
+
+def test_reused_token_filename_does_not_inherit_prior_account_history(tmp_path):
+    """Old account's hash records under a filename must not skip for a new Gmail user."""
+    store = StateStore(tmp_path / "state.db")
+    store.connect()
+    # Legacy path-keyed history from the previous owner of token2.json
+    store.record_hash_delivery(HASH, "token2.json", "gid-old", account_id="isp1")
+    store.record_hash_delivery(HASH, "gmail:old@example.com", "gid-old", account_id="isp1")
+
+    with (
+        patch("fetcher.run.import_message", return_value="gid-new") as mock_import,
+        patch("fetcher.run.gmail_has_message_with_id", return_value=False),
+    ):
+        result = _deliver_to_gmail_destinations(
+            gmail_contexts=[_ctx("gmail:new@example.com")],
+            raw=RAW_NO_MID,
+            uid=10,
+            account_id="isp1",
+            message_hash=HASH,
+            never_mark_spam=True,
+            mark_unread=True,
+            state=store,
+        )
+    assert result.any_imported is True
+    assert mock_import.call_count == 1
+    assert store.has_delivered_hash_to(HASH, "gmail:new@example.com", account_id="isp1")
+    store.close()
+
+
+def test_clear_hash_deliveries_for_destinations(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    store.connect()
+    store.record_hash_delivery(HASH, "gmail:old@example.com", "gid", account_id="isp1")
+    store.record_hash_delivery(HASH, "token2.json", "gid", account_id="isp1")
+    store.record_hash_delivery(HASH, "gmail:keep@example.com", "gid", account_id="isp1")
+    removed = store.clear_hash_deliveries_for_destinations(
+        {"gmail:old@example.com", "token2.json"}
+    )
+    assert removed == 2
+    assert not store.has_delivered_hash_to(HASH, "gmail:old@example.com", account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, "gmail:keep@example.com", account_id="isp1")
+    store.close()
+
+
+def test_oauth_fingerprint_fallback_when_profile_unavailable(tmp_path):
+    token = tmp_path / "token2.json"
+    token.write_text(json.dumps({"refresh_token": "rt-secret-1"}), encoding="utf-8")
+    service = MagicMock()
+    service.users().getProfile().execute.side_effect = RuntimeError("offline")
+    key = gmail_destination_identity(service, token)
+    assert key.startswith("oauth:")
+    # Different refresh token → different identity (reused filename, new account).
+    token.write_text(json.dumps({"refresh_token": "rt-secret-2"}), encoding="utf-8")
+    key2 = gmail_destination_identity(service, token)
+    assert key2.startswith("oauth:")
+    assert key2 != key

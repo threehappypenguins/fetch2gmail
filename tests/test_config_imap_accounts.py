@@ -6,7 +6,9 @@ import pytest
 
 from fetcher.config import (
     get_gmail_destinations_for_imap,
+    get_imap_account,
     get_imap_accounts,
+    load_config,
     password_env_for_account_id,
     password_env_key_for_account_id,
     validate_unique_password_env_keys,
@@ -26,7 +28,7 @@ def test_validate_unique_password_env_keys_rejects_normalized_collisions():
     validate_unique_password_env_keys(["isp1", "isp2"])  # ok
     with pytest.raises(ValueError, match="my-isp"):
         validate_unique_password_env_keys(["my-isp", "my_isp"])
-    with pytest.raises(ValueError, match="credential key"):
+    with pytest.raises(ValueError, match="credential"):
         validate_unique_password_env_keys(["WorkMail", "workmail"])
 
 
@@ -40,6 +42,31 @@ def test_validate_unique_password_env_keys_rejects_custom_vs_derived_collision()
         validate_unique_password_env_keys(["a", "b"], existing_by_id=existing)
 
 
+def test_validate_unique_password_env_keys_rejects_plaintext_vs_enc_collision():
+    from fetcher.config import password_env_for_account_id, reserved_credential_env_names
+
+    assert password_env_for_account_id("foo") == "IMAP_PASSWORD_FOO"
+    assert password_env_for_account_id("foo_enc") == "IMAP_PASSWORD_FOO_ENC"
+    assert reserved_credential_env_names("IMAP_PASSWORD_FOO") == (
+        "IMAP_PASSWORD_FOO",
+        "IMAP_PASSWORD_FOO_ENC",
+    )
+    with pytest.raises(ValueError, match="IMAP_PASSWORD_FOO_ENC"):
+        validate_unique_password_env_keys(["foo", "foo_enc"])
+    # default uses IMAP_PASSWORD / IMAP_PASSWORD_ENC; id "enc" derives IMAP_PASSWORD_ENC
+    with pytest.raises(ValueError, match="IMAP_PASSWORD_ENC"):
+        validate_unique_password_env_keys(["default", "enc"])
+
+
+def test_validate_unique_password_env_keys_rejects_custom_enc_suffix_collision():
+    existing = {
+        "a": {"id": "a", "password_env": "ISP_SECRET"},
+        "b": {"id": "b", "password_env": "ISP_SECRET_ENC"},
+    }
+    with pytest.raises(ValueError, match="ISP_SECRET_ENC"):
+        validate_unique_password_env_keys(["a", "b"], existing_by_id=existing)
+
+
 def test_get_imap_accounts_legacy_single():
     cfg = {"imap": {"host": "h", "username": "u", "password_env": "IMAP_PASSWORD"}}
     accounts = get_imap_accounts(cfg)
@@ -47,6 +74,65 @@ def test_get_imap_accounts_legacy_single():
     assert accounts[0]["id"] == "default"
     assert accounts[0]["host"] == "h"
     assert accounts[0]["password_env"] == "IMAP_PASSWORD"
+
+
+def test_resolve_password_derives_default_password_env_when_omitted(tmp_path, monkeypatch):
+    """Account id isp1 with no password_env must read IMAP_PASSWORD_ISP1."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        """
+        {
+          "imap_accounts": [
+            {
+              "id": "isp1",
+              "host": "h",
+              "username": "u",
+              "mailbox": "INBOX"
+            }
+          ],
+          "gmail_accounts": [{"token_path": "token.json"}]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("IMAP_PASSWORD_ISP1", "secret-isp1")
+    monkeypatch.delenv("IMAP_PASSWORD_ISP1_ENC", raising=False)
+
+    cfg = load_config(cfg_path, resolve_password=True, account_id="isp1")
+    imap = get_imap_account(cfg, "isp1")
+    assert imap.get("password") == "secret-isp1"
+    assert imap.get("password_env") == "IMAP_PASSWORD_ISP1"
+
+
+def test_load_config_preserves_legacy_imap_gmail_token_paths(tmp_path, monkeypatch):
+    """Password resolve must not drop an explicit legacy imap routing subset."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        """
+        {
+          "imap": {
+            "host": "h",
+            "username": "u",
+            "password_env": "IMAP_PASSWORD",
+            "mailbox": "INBOX",
+            "gmail_token_paths": ["token2.json"]
+          },
+          "gmail_accounts": [
+            {"token_path": "token.json"},
+            {"token_path": "token2.json"}
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("IMAP_PASSWORD", "secret")
+    monkeypatch.delenv("IMAP_PASSWORD_ENC", raising=False)
+
+    cfg = load_config(cfg_path, resolve_password=True)
+    assert cfg["imap"].get("gmail_token_paths") == ["token2.json"]
+    imap = get_imap_account(cfg)
+    dest = get_gmail_destinations_for_imap(cfg, imap)
+    assert [d["token_path"] for d in dest] == ["token2.json"]
 
 
 def test_get_imap_accounts_array():

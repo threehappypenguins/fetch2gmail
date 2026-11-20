@@ -39,7 +39,7 @@ from .gmail_client import get_gmail_service
 from .idle_watcher import pause_idle_connection, watcher_loop
 from .imap_client import get_uid_validity
 from .log_buffer import get_recent_logs, install_log_buffer
-from .run import run_once, run_copy_all, setup_logging
+from .run import destination_keys_for_token_invalidation, run_once, run_copy_all, setup_logging
 from .state import StateStore
 from .ui_auth import create_ui_auth, load_ui_auth, verify_ui_auth
 
@@ -1219,11 +1219,33 @@ def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> 
     if imap_accounts:
         cfg["imap_accounts"] = imap_accounts
         cfg.pop("imap", None)
+
+    # Drop delivery history for this Gmail identity before the token file is gone,
+    # so a reused filename cannot inherit the previous account's skip records.
+    cfg_dir = _config_dir()
+    removed_acct = accounts[body.index]
+    try:
+        state_cfg = cfg.get("state") or {}
+        raw_db = state_cfg.get("db_path", "state.db")
+        db_path = Path(raw_db)
+        if not db_path.is_absolute():
+            db_path = cfg_dir / db_path
+        invalidate_keys = destination_keys_for_token_invalidation(
+            token_path,
+            cfg_dir,
+            credentials_path=removed_acct.get("credentials_path", "credentials.json"),
+        )
+        store = StateStore(str(db_path))
+        store.connect()
+        store.clear_hash_deliveries_for_destinations(invalidate_keys)
+        store.close()
+    except Exception:
+        logger.exception("Failed to clear hash delivery history for removed Gmail account")
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     try:
         # Delete token file (only if inside config dir and named token*.json)
-        cfg_dir = _config_dir()
         tp = Path(token_path)
         if not tp.is_absolute():
             tp = cfg_dir / tp

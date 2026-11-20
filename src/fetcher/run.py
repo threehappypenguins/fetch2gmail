@@ -10,6 +10,8 @@ via gmail_token_paths).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -57,6 +59,73 @@ def _ensure_label(service: Any, label_name: str) -> str:
     return created["id"]
 
 
+def _oauth_token_fingerprint(token_path: Path) -> str | None:
+    """Stable id for one OAuth grant; changes when a different account reuses the file."""
+    try:
+        data = json.loads(token_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    secret = str(data.get("refresh_token") or data.get("token") or "").strip()
+    if not secret:
+        return None
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:32]
+    return f"oauth:{digest}"
+
+
+def gmail_destination_identity(service: Any, token_path: Path) -> str:
+    """
+    Stable Gmail-account identity for delivery history.
+
+    Prefer the mailbox email so a reused token filename (e.g. token2.json) for a
+    different Google account does not inherit the previous account's skip records.
+    Fall back to an OAuth-token fingerprint, then the token path as last resort.
+    """
+    try:
+        profile = service.users().getProfile(userId=USER_ID).execute()
+        email = str(profile.get("emailAddress") or "").strip().lower()
+        if email:
+            return f"gmail:{email}"
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not resolve Gmail email for %s", token_path, exc_info=True)
+    fingerprint = _oauth_token_fingerprint(token_path)
+    if fingerprint:
+        return fingerprint
+    return f"path:{_token_path_identity(token_path) or token_path.name}"
+
+
+def destination_keys_for_token_invalidation(
+    token_path: str | Path,
+    config_dir: Path,
+    *,
+    credentials_path: str | Path | None = None,
+) -> set[str]:
+    """
+    Keys whose delivery history should be cleared when a token is removed/replaced.
+
+    Includes path-based legacy keys plus best-effort email/oauth identities.
+    """
+    raw = _token_path_identity(token_path) or "token.json"
+    tp = Path(str(token_path))
+    if not tp.is_absolute():
+        tp = config_dir / tp
+    keys: set[str] = {raw, tp.name, f"path:{raw}", f"path:{tp.name}"}
+    fingerprint = _oauth_token_fingerprint(tp)
+    if fingerprint:
+        keys.add(fingerprint)
+    try:
+        cred = Path(credentials_path or "credentials.json")
+        if not cred.is_absolute():
+            cred = config_dir / cred
+        if tp.exists() and cred.exists():
+            service = get_gmail_service(cred, tp)
+            keys.add(gmail_destination_identity(service, tp))
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not resolve Gmail identity to invalidate for %s", tp, exc_info=True)
+    return {k for k in keys if k}
+
+
 def _build_gmail_contexts(
     gmail_accounts: list[dict[str, Any]],
     config_dir: Path,
@@ -64,13 +133,12 @@ def _build_gmail_contexts(
     """
     Build list of (service, label_id, inbox_label_id, unread_label_id, destination_key).
     Paths in account dicts are resolved relative to config_dir.
-    destination_key is the configured token_path identity for per-hash delivery records.
+    destination_key is a stable Gmail-account identity (not a reusable filename).
     """
     contexts: list[GmailContext] = []
     for acct in gmail_accounts:
         cred_path = Path(acct.get("credentials_path", "credentials.json"))
         token_path_raw = acct.get("token_path", "token.json")
-        destination_key = _token_path_identity(token_path_raw) or "token.json"
         token_path = Path(token_path_raw)
         if not cred_path.is_absolute():
             cred_path = config_dir / cred_path
@@ -79,6 +147,7 @@ def _build_gmail_contexts(
         use_label = acct.get("use_label") if "use_label" in acct else bool((acct.get("label") or "").strip())
         label_name = (acct.get("label") or "ISP Mail").strip() if use_label else None
         service = get_gmail_service(cred_path, token_path)
+        destination_key = gmail_destination_identity(service, token_path)
         inbox_label_id = get_inbox_label_id(service, USER_ID)
         unread_label_id = get_unread_label_id(service, USER_ID)
         label_id = _ensure_label(service, label_name) if label_name else None

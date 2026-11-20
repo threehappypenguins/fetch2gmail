@@ -57,7 +57,7 @@ def test_api_config_update_rejects_derived_key_collision_before_password_writes(
             api_config_update(MagicMock(), update)
 
     assert exc.value.status_code == 400
-    assert "credential key" in str(exc.value.detail)
+    assert "credential" in str(exc.value.detail)
     assert writes == []
 
 

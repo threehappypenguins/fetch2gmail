@@ -368,6 +368,26 @@ class StateStore:
         )
         self._conn.commit()
 
+    def clear_hash_deliveries_for_destinations(self, destination_keys: list[str] | set[str]) -> int:
+        """
+        Remove delivery history for the given Gmail destination identities.
+
+        Used when a Gmail account/token is removed or replaced so a reused token
+        filename cannot inherit the previous account's skip history.
+        """
+        keys = [str(k).strip() for k in destination_keys if str(k).strip()]
+        if not keys:
+            return 0
+        self.connect()
+        assert self._conn is not None
+        placeholders = ",".join("?" * len(keys))
+        cur = self._conn.execute(
+            f"DELETE FROM hash_deliveries WHERE destination_key IN ({placeholders})",
+            keys,
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
     def record_import(
         self,
         message_hash: str,

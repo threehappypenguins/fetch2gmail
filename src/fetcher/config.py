@@ -51,48 +51,71 @@ def effective_password_env(
     return password_env_for_account_id(account_id)
 
 
+def reserved_credential_env_names(password_env: str) -> tuple[str, str]:
+    """
+    Env names reserved by one password_env key: plaintext and encrypted forms.
+
+    set_encrypted_env(key) writes key_ENC and deletes any plain key= line. So
+    account "foo" (IMAP_PASSWORD_FOO / IMAP_PASSWORD_FOO_ENC) collides with
+    account "foo_enc" (IMAP_PASSWORD_FOO_ENC as plaintext).
+    """
+    key = (password_env or "").strip()
+    return key, f"{key}_ENC"
+
+
 def validate_unique_password_env_keys(
     account_ids: list[str],
     *,
     existing_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """
-    Raise ValueError if two accounts would share the same effective credential key.
+    Raise ValueError if two accounts would share a credential environment name.
 
-    Checks both derived keys (my-isp / my_isp → IMAP_PASSWORD_MY_ISP) and
-    preserved custom password_env values (e.g. existing account a with
-    IMAP_PASSWORD_B colliding with new account b).
+    Reserves both the plaintext key and its _ENC counterpart for each effective
+    password_env (derived or custom). That catches cases like foo vs foo_enc,
+    where the first account's ciphertext name is the second's plaintext name.
     """
     existing_by_id = existing_by_id or {}
+    # reserved env name -> account id that claimed it
     seen: dict[str, str] = {}
     for raw in account_ids:
         acct_id = (raw or "").strip()
         if not acct_id:
             continue
         key = effective_password_env(acct_id, existing_by_id.get(acct_id))
-        prev = seen.get(key)
-        if prev is not None and prev != acct_id:
-            raise ValueError(
-                f"IMAP account ids {prev!r} and {acct_id!r} both use credential key {key}; "
-                "choose a different id or update the existing account's password_env first"
-            )
-        seen[key] = acct_id
+        for name in reserved_credential_env_names(key):
+            if not name:
+                continue
+            prev = seen.get(name)
+            if prev is not None and prev != acct_id:
+                raise ValueError(
+                    f"IMAP account ids {prev!r} and {acct_id!r} both use credential "
+                    f"environment name {name}; "
+                    "choose a different id or update the existing account's password_env first"
+                )
+            seen[name] = acct_id
 
 
 def _resolve_imap_password(imap: dict[str, Any], config_dir: Path) -> dict[str, Any]:
-    """Return imap dict with password filled from env / encrypted .env when needed."""
+    """Return imap dict with password filled from env / encrypted .env when needed.
+
+    When password_env is omitted, derive the same default used by the UI/save path
+    (IMAP_PASSWORD for id "default", else IMAP_PASSWORD_<ID>).
+    """
     if imap.get("password") not in (None, ""):
         return imap
-    key = imap.get("password_env")
-    if not key:
-        return imap
     acct_id = str(imap.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+    key = str(imap.get("password_env") or "").strip() or password_env_for_account_id(acct_id)
     enc_val = os.environ.get(f"{key}_ENC")
     if enc_val:
         from .env_file import decrypt_env_value
 
         try:
-            return {**imap, "password": decrypt_env_value(config_dir, enc_val)}
+            return {
+                **imap,
+                "password_env": key,
+                "password": decrypt_env_value(config_dir, enc_val),
+            }
         except Exception as e:
             raise ValueError(
                 f"IMAP password for account {acct_id!r} could not be decrypted ({key}_ENC): {e}"
@@ -103,7 +126,7 @@ def _resolve_imap_password(imap: dict[str, Any], config_dir: Path) -> dict[str, 
             f"IMAP password for account {acct_id!r} is not set "
             f"(environment variable {key} or {key}_ENC required)"
         )
-    return {**imap, "password": plain_val}
+    return {**imap, "password_env": key, "password": plain_val}
 
 
 def _store_resolved_imap_account(cfg: dict[str, Any], resolved: dict[str, Any]) -> None:
@@ -116,14 +139,12 @@ def _store_resolved_imap_account(cfg: dict[str, Any], resolved: dict[str, Any]) 
         # Keep legacy `imap` in sync when it is the first / matching account.
         first_id = str(cfg["imap_accounts"][0].get("id") or DEFAULT_IMAP_ACCOUNT_ID)
         if "imap" in cfg and acct_id == first_id:
-            cfg["imap"] = {
-                k: v for k, v in resolved.items() if k not in ("id", "gmail_token_paths")
-            }
+            # Preserve gmail_token_paths; stripping them would mean "all destinations".
+            cfg["imap"] = {k: v for k, v in resolved.items() if k != "id"}
         return
-    # Legacy single-imap config
-    cfg["imap"] = {
-        k: v for k, v in resolved.items() if k not in ("id", "gmail_token_paths")
-    }
+    # Legacy single-imap config — keep gmail_token_paths so an explicit subset is
+    # not reinterpreted as "all Gmail accounts" after password resolution.
+    cfg["imap"] = {k: v for k, v in resolved.items() if k != "id"}
 
 
 def load_config(
