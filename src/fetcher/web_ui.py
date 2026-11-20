@@ -29,6 +29,7 @@ from .config import (
     get_gmail_destinations_for_imap,
     get_imap_accounts,
     load_config,
+    effective_password_env,
     password_env_for_account_id,
     validate_unique_password_env_keys,
     prune_stale_gmail_routes,
@@ -885,10 +886,8 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    # set_encrypted_env also refreshes IMAP_PASSWORD_ENC in os.environ for watchers.
     set_encrypted_env(_config_dir(), "IMAP_PASSWORD", body.imap_password)
-    from dotenv import load_dotenv
-
-    load_dotenv(_config_dir() / ".env")
     _sync_watcher_threads()
     return {"status": "ok", "message": "Config created. Connect Gmail next."}
 
@@ -915,8 +914,6 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="config.json not found")
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
-
-    from dotenv import load_dotenv
 
     # Gmail accounts first so routing validation can use the new list.
     if update.gmail_accounts is not None:
@@ -945,11 +942,22 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
             cfg.pop("gmail", None)
 
     gmail_accounts = get_gmail_accounts(cfg)
+    # Defer .env writes until the full update validates; commit with config.json.
+    pending_password_writes: list[tuple[str, str]] = []
 
     if update.imap_accounts is not None:
         if not update.imap_accounts:
             raise HTTPException(status_code=400, detail="At least one IMAP account is required")
-        # Validate ids + derived credential keys for the whole list before any password writes.
+        # Existing accounts by id — blank password means "keep current credentials".
+        existing_by_id: dict[str, dict[str, Any]] = {}
+        try:
+            for prev in get_imap_accounts(cfg):
+                existing_by_id[str(prev.get("id") or DEFAULT_IMAP_ACCOUNT_ID)] = prev
+        except ValueError:
+            existing_by_id = {}
+
+        # Validate ids + effective credential keys (incl. preserved custom password_env)
+        # for the whole list before any password writes.
         seen_ids: set[str] = set()
         submitted_ids: list[str] = []
         for acct in update.imap_accounts:
@@ -961,17 +969,11 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
             seen_ids.add(acct_id)
             submitted_ids.append(acct_id)
         try:
-            validate_unique_password_env_keys(submitted_ids)
+            validate_unique_password_env_keys(
+                submitted_ids, existing_by_id=existing_by_id
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-
-        # Existing accounts by id — blank password means "keep current credentials".
-        existing_by_id: dict[str, dict[str, Any]] = {}
-        try:
-            for prev in get_imap_accounts(cfg):
-                existing_by_id[str(prev.get("id") or DEFAULT_IMAP_ACCOUNT_ID)] = prev
-        except ValueError:
-            existing_by_id = {}
 
         new_accounts: list[dict[str, Any]] = []
         for acct in update.imap_accounts:
@@ -984,11 +986,7 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
                         status_code=400, detail=f"since_date for {acct_id} must be YYYY-MM-DD"
                     )
             existing = existing_by_id.get(acct_id)
-            # Prefer an existing custom password_env (e.g. ISP_SECRET) over regenerating.
-            if existing and existing.get("password_env"):
-                password_env = str(existing["password_env"])
-            else:
-                password_env = password_env_for_account_id(acct_id)
+            password_env = effective_password_env(acct_id, existing)
             entry: dict[str, Any] = {
                 "id": acct_id,
                 "host": acct.host,
@@ -1016,8 +1014,8 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
                     )
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=f"[{acct_id}] {e}") from e
-                set_encrypted_env(_config_dir(), password_env, acct.password)
-                # Password now lives in .env; do not keep a stale inline password.
+                # Queue write; flush only after the entire update validates.
+                pending_password_writes.append((password_env, acct.password))
             elif existing:
                 # Leave blank → keep prior credential fields (inline password and/or env key).
                 if existing.get("password") not in (None, ""):
@@ -1026,7 +1024,6 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         _validate_imap_accounts_routing(new_accounts, gmail_accounts)
         cfg["imap_accounts"] = new_accounts
         cfg.pop("imap", None)
-        load_dotenv(_config_dir() / ".env")
     else:
         # Legacy single-IMAP field updates → mutate first account / legacy imap.
         try:
@@ -1080,8 +1077,7 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
                 raise HTTPException(status_code=400, detail=str(e))
             password_env = first.get("password_env") or "IMAP_PASSWORD"
             first["password_env"] = password_env
-            set_encrypted_env(_config_dir(), password_env, update.imap_password)
-            load_dotenv(_config_dir() / ".env")
+            pending_password_writes.append((password_env, update.imap_password))
         if update.imap_host is not None:
             first["host"] = update.imap_host
         if update.imap_port is not None:
@@ -1113,10 +1109,10 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         cfg["imap_accounts"] = accounts
         cfg.pop("imap", None)
 
-    # Strip removed Gmail token paths from IMAP routing lists.
+    # Strip removed Gmail token paths from IMAP routing lists (full-path identity).
     # Reject if that would empty an explicit route (empty means "all destinations").
     valid_tokens = {
-        Path(str(a.get("token_path", "token.json"))).name for a in get_gmail_accounts(cfg)
+        str(a.get("token_path", "token.json")).strip() for a in get_gmail_accounts(cfg)
     }
     try:
         prune_stale_gmail_routes(cfg.get("imap_accounts") or [], valid_tokens)
@@ -1127,6 +1123,12 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         cfg["poll_interval_minutes"] = update.poll_interval_minutes
     if update.state_db_path is not None:
         cfg.setdefault("state", {})["db_path"] = update.state_db_path
+
+    # All validation passed — commit credentials and config together.
+    # set_encrypted_env refreshes only these keys in os.environ (load_dotenv would
+    # not override existing *_ENC values, so watchers would keep the old password).
+    for password_env, password in pending_password_writes:
+        set_encrypted_env(_config_dir(), password_env, password)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     _sync_watcher_threads()
@@ -1208,7 +1210,7 @@ def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> 
     except ValueError:
         imap_accounts = []
     valid_tokens = {
-        Path(str(a.get("token_path", "token.json"))).name for a in new_accounts
+        str(a.get("token_path", "token.json")).strip() for a in new_accounts
     }
     try:
         prune_stale_gmail_routes(imap_accounts, valid_tokens)
@@ -1698,7 +1700,7 @@ _APP_JS = r"""
         for (var g = 0; g < _gmailAccountsForRouting.length; g++) {
           var ga = _gmailAccountsForRouting[g];
           var tp = ga.token_path || 'token.json';
-          var checked = allSelected || selected[tp] || selected[tp.split(/[/\\\\]/).pop()];
+          var checked = allSelected || !!selected[tp];
           html += '<label style="display:block;"><input type="checkbox" data-gmail-token="' + esc(tp) + '"' + (checked && !allSelected ? ' checked' : '') + '> ' + esc(ga.label || tp) + ' (<code>' + esc(tp) + '</code>)</label>';
         }
       }

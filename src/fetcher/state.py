@@ -4,7 +4,8 @@ SQLite state store for idempotent fetch.
 Stores (scoped by account_id):
 - uid_validity per mailbox (to detect server resets)
 - last_processed_uid per (account_id, mailbox, uid_validity)
-- message_hash -> gmail_message_id (to dedupe when UID/UIDVALIDITY change)
+- message_hash -> gmail_message_id (legacy aggregate record)
+- message_hash + destination_key -> gmail_message_id (per-destination delivery)
 - uid -> gmail_message_id (optional, for quick lookup)
 """
 
@@ -85,8 +86,10 @@ class StateStore:
     def _migrate_add_account_id(self) -> None:
         """Rebuild tables to include account_id; existing rows become account_id='default'.
 
-        Caller must hold the schema file lock and recheck that migration is still
-        needed. Avoids executescript() (it auto-COMMITs before running).
+        Caller must hold the schema file lock, recheck that migration is still
+        needed, and keep an open write transaction (BEGIN IMMEDIATE) so a mid-
+        rebuild failure can roll back — including DROP of uid_state_new etc.
+        Avoids executescript() (it auto-COMMITs before running).
         """
         assert self._conn is not None
         logger.info("Migrating state.db to add account_id column (default=%r)", DEFAULT_ACCOUNT_ID)
@@ -201,29 +204,51 @@ class StateStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash ON uid_to_gmail(message_hash)"
         )
+        self._ensure_hash_deliveries_table()
+
+    def _ensure_hash_deliveries_table(self) -> None:
+        """Per-(hash, destination) delivery records; additive for existing DBs."""
+        assert self._conn is not None
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hash_deliveries (
+                account_id TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                destination_key TEXT NOT NULL,
+                gmail_message_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                PRIMARY KEY (account_id, message_hash, destination_key)
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hash_deliveries_hash "
+            "ON hash_deliveries(account_id, message_hash)"
+        )
 
     def _create_tables(self) -> None:
         """Inspect schema and create/migrate. Caller must hold `_schema_lock`.
 
         Recheck after the lock is acquired so concurrent workers do not both create
-        or migrate. SQLite auto-commits before DDL, so BEGIN IMMEDIATE alone cannot
-        span CREATE TABLE — the file lock is the real serializer.
+        or migrate. The file lock serializes schema work across processes; the open
+        BEGIN IMMEDIATE transaction lets a failed account_id rebuild roll back
+        completely (no leftover uid_state_new).
         """
         assert self._conn is not None
-        # DB write lock for the inspection window before any DDL auto-commit.
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             tables = self._list_tables()
             needs_fresh = "uid_state" not in tables
             needs_migrate = (not needs_fresh) and self._needs_account_id_migration()
             if needs_fresh:
+                # Fresh create: commit inspection txn, then create tables.
                 self._conn.commit()
                 self._create_fresh_schema()
                 self._conn.commit()
             elif needs_migrate:
                 # Recheck: another worker may have migrated while we waited for the lock.
                 if self._needs_account_id_migration():
-                    self._conn.commit()
+                    # Keep BEGIN IMMEDIATE open through the rebuild; commit only on success.
                     self._migrate_add_account_id()
                     self._conn.commit()
                 else:
@@ -234,6 +259,9 @@ class StateStore:
                     "ON uid_to_gmail(message_hash)"
                 )
                 self._conn.commit()
+            # Always ensure additive hash_deliveries exists (fresh or upgraded DB).
+            self._ensure_hash_deliveries_table()
+            self._conn.commit()
         except Exception:
             try:
                 self._conn.rollback()
@@ -291,7 +319,7 @@ class StateStore:
         message_hash: str,
         account_id: str = DEFAULT_ACCOUNT_ID,
     ) -> bool:
-        """Return True if we have already imported a message with this SHA256 hash for this account."""
+        """Return True if we have a legacy aggregate hash record for this account."""
         self.connect()
         assert self._conn is not None
         row = self._conn.execute(
@@ -299,6 +327,46 @@ class StateStore:
             (account_id, message_hash),
         ).fetchone()
         return row is not None
+
+    def has_delivered_hash_to(
+        self,
+        message_hash: str,
+        destination_key: str,
+        account_id: str = DEFAULT_ACCOUNT_ID,
+    ) -> bool:
+        """True if this source hash was successfully delivered to this Gmail destination."""
+        self.connect()
+        assert self._conn is not None
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM hash_deliveries
+            WHERE account_id = ? AND message_hash = ? AND destination_key = ?
+            """,
+            (account_id, message_hash, destination_key),
+        ).fetchone()
+        return row is not None
+
+    def record_hash_delivery(
+        self,
+        message_hash: str,
+        destination_key: str,
+        gmail_message_id: str,
+        account_id: str = DEFAULT_ACCOUNT_ID,
+    ) -> None:
+        """Persist successful (or already-present) delivery of a hash to one destination."""
+        self.connect()
+        assert self._conn is not None
+        self._conn.execute(
+            """
+            INSERT INTO hash_deliveries
+                (account_id, message_hash, destination_key, gmail_message_id, created_at)
+            VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
+            ON CONFLICT (account_id, message_hash, destination_key) DO UPDATE SET
+                gmail_message_id = excluded.gmail_message_id
+            """,
+            (account_id, message_hash, destination_key, gmail_message_id),
+        )
+        self._conn.commit()
 
     def record_import(
         self,

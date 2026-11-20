@@ -30,6 +30,16 @@ def test_validate_unique_password_env_keys_rejects_normalized_collisions():
         validate_unique_password_env_keys(["WorkMail", "workmail"])
 
 
+def test_validate_unique_password_env_keys_rejects_custom_vs_derived_collision():
+    from fetcher.config import effective_password_env
+
+    existing = {"a": {"id": "a", "password_env": "IMAP_PASSWORD_B"}}
+    assert effective_password_env("a", existing["a"]) == "IMAP_PASSWORD_B"
+    assert effective_password_env("b") == "IMAP_PASSWORD_B"
+    with pytest.raises(ValueError, match="IMAP_PASSWORD_B"):
+        validate_unique_password_env_keys(["a", "b"], existing_by_id=existing)
+
+
 def test_get_imap_accounts_legacy_single():
     cfg = {"imap": {"host": "h", "username": "u", "password_env": "IMAP_PASSWORD"}}
     accounts = get_imap_accounts(cfg)
@@ -99,6 +109,39 @@ def test_gmail_destinations_subset():
     assert dest[0]["token_path"] == "token2.json"
 
 
+def test_gmail_destinations_full_path_not_basename():
+    """Same basename under different directories must not cross-match."""
+    cfg = {
+        "gmail_accounts": [
+            {"token_path": "old/token.json", "label": "Old"},
+            {"token_path": "other/token.json", "label": "Other"},
+        ]
+    }
+    imap = {"id": "isp1", "gmail_token_paths": ["old/token.json"]}
+    dest = get_gmail_destinations_for_imap(cfg, imap)
+    assert len(dest) == 1
+    assert dest[0]["token_path"] == "old/token.json"
+
+    # Basename-only route must not silently resolve to either account.
+    with pytest.raises(ValueError, match="Unknown gmail_token_path"):
+        get_gmail_destinations_for_imap(
+            cfg, {"id": "isp1", "gmail_token_paths": ["token.json"]}
+        )
+
+
+def test_gmail_destinations_absolute_path():
+    cfg = {
+        "gmail_accounts": [
+            {"token_path": "/data/gmail/token.json", "label": "Abs"},
+            {"token_path": "token.json", "label": "Rel"},
+        ]
+    }
+    imap = {"id": "isp1", "gmail_token_paths": ["/data/gmail/token.json"]}
+    dest = get_gmail_destinations_for_imap(cfg, imap)
+    assert len(dest) == 1
+    assert dest[0]["token_path"] == "/data/gmail/token.json"
+
+
 def test_gmail_destinations_unknown_path_raises():
     cfg = {"gmail_accounts": [{"token_path": "token.json"}]}
     imap = {"id": "isp1", "gmail_token_paths": ["missing.json"]}
@@ -126,6 +169,30 @@ def test_prune_stale_routes_rejects_emptying_explicit_route():
         prune_stale_gmail_routes(accounts, {"token.json"})
     # Unchanged on failure
     assert accounts[0]["gmail_token_paths"] == ["token2.json"]
+
+
+def test_prune_does_not_keep_route_via_shared_basename():
+    """Deleting old/token.json must not leave the route pointing at other/token.json."""
+    from fetcher.config import prune_stale_gmail_routes
+
+    accounts = [{"id": "isp1", "gmail_token_paths": ["old/token.json"]}]
+    with pytest.raises(ValueError, match="explicitly routed"):
+        prune_stale_gmail_routes(accounts, {"other/token.json"})
+    assert accounts[0]["gmail_token_paths"] == ["old/token.json"]
+
+
+def test_prune_keeps_absolute_routes():
+    from fetcher.config import prune_stale_gmail_routes
+
+    abs_path = "/opt/fetch2gmail/token2.json"
+    accounts = [
+        {
+            "id": "isp1",
+            "gmail_token_paths": [abs_path, "/opt/fetch2gmail/gone.json"],
+        }
+    ]
+    prune_stale_gmail_routes(accounts, {abs_path, "/opt/fetch2gmail/token.json"})
+    assert accounts[0]["gmail_token_paths"] == [abs_path]
 
 
 def test_load_config_resolves_only_selected_account(tmp_path, monkeypatch):

@@ -1,10 +1,11 @@
 """
 Main fetch run: IMAP -> Gmail import -> state update -> delete from ISP.
 
-Idempotency: UID + RFC822 Message-ID checks per Gmail destination (source hash is recorded
-but never alone proves delivery). Only skip or delete from ISP after every *current*
-destination already has the message or a successful import. Dry-run skips Gmail and delete.
-Supports multiple Gmail accounts (per-IMAP routing via gmail_token_paths).
+Idempotency: UID + per-destination checks via RFC822 Message-ID and/or persisted
+(source hash, destination) delivery records. A source hash alone never proves
+delivery to every current route — newly added destinations still receive mail.
+Dry-run skips Gmail and delete. Supports multiple Gmail accounts (per-IMAP routing
+via gmail_token_paths).
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any
 
 from .config import (
     DEFAULT_IMAP_ACCOUNT_ID,
+    _token_path_identity,
     get_gmail_destinations_for_imap,
     get_imap_account,
     get_imap_accounts,
@@ -39,6 +41,9 @@ logger = logging.getLogger(__name__)
 # Gmail API user id
 USER_ID = "me"
 
+# (service, label_id, inbox_label_id, unread_label_id, destination_key)
+GmailContext = tuple[Any, str | None, str, str, str]
+
 
 def _ensure_label(service: Any, label_name: str) -> str:
     """Return label ID for given name; create if missing."""
@@ -55,15 +60,18 @@ def _ensure_label(service: Any, label_name: str) -> str:
 def _build_gmail_contexts(
     gmail_accounts: list[dict[str, Any]],
     config_dir: Path,
-) -> list[tuple[Any, str | None, str, str]]:
+) -> list[GmailContext]:
     """
-    Build list of (service, label_id, inbox_label_id, unread_label_id) for each account.
+    Build list of (service, label_id, inbox_label_id, unread_label_id, destination_key).
     Paths in account dicts are resolved relative to config_dir.
+    destination_key is the configured token_path identity for per-hash delivery records.
     """
-    contexts = []
+    contexts: list[GmailContext] = []
     for acct in gmail_accounts:
         cred_path = Path(acct.get("credentials_path", "credentials.json"))
-        token_path = Path(acct.get("token_path", "token.json"))
+        token_path_raw = acct.get("token_path", "token.json")
+        destination_key = _token_path_identity(token_path_raw) or "token.json"
+        token_path = Path(token_path_raw)
         if not cred_path.is_absolute():
             cred_path = config_dir / cred_path
         if not token_path.is_absolute():
@@ -74,7 +82,7 @@ def _build_gmail_contexts(
         inbox_label_id = get_inbox_label_id(service, USER_ID)
         unread_label_id = get_unread_label_id(service, USER_ID)
         label_id = _ensure_label(service, label_name) if label_name else None
-        contexts.append((service, label_id, inbox_label_id, unread_label_id))
+        contexts.append((service, label_id, inbox_label_id, unread_label_id, destination_key))
     return contexts
 
 
@@ -106,20 +114,23 @@ class _DeliverResult:
 
 def _deliver_to_gmail_destinations(
     *,
-    gmail_contexts: list[tuple[Any, str | None, str, str]],
+    gmail_contexts: list[GmailContext],
     raw: bytes,
     uid: int,
     account_id: str,
+    message_hash: str,
     never_mark_spam: bool,
     mark_unread: bool,
+    state: StateStore | None = None,
     log_prefix: str = "",
 ) -> _DeliverResult:
     """
     Ensure every current Gmail destination has this message.
 
-    Uses RFC822 Message-ID to skip destinations that already have it. Source-side
-    hash history is intentionally not used here: after routing changes, a hash from
-    an earlier import to Gmail A must not skip delivery to Gmail B.
+    A destination is skipped when Gmail already has the RFC822 Message-ID, or when
+    state records a prior successful delivery of this source hash to that
+    destination_key. Aggregate hash history alone never skips a destination that
+    has not yet received the message (so new routes still get mail).
     """
     prefix = f"{log_prefix} " if log_prefix else ""
     message_id_header = _parse_message_id_from_raw(raw)
@@ -129,16 +140,41 @@ def _deliver_to_gmail_destinations(
     all_already_had = True
     skip_entire_message = False
 
-    for idx, (service, label_id, inbox_label_id, unread_label_id) in enumerate(gmail_contexts):
+    for idx, (service, label_id, inbox_label_id, unread_label_id, destination_key) in enumerate(
+        gmail_contexts
+    ):
         try:
             already_here = False
             if message_id_header:
                 already_here = gmail_has_message_with_id(
                     service, USER_ID, message_id_header
                 )
-            if already_here:
+            if (
+                not already_here
+                and state is not None
+                and message_hash
+                and state.has_delivered_hash_to(
+                    message_hash, destination_key, account_id=account_id
+                )
+            ):
+                already_here = True
                 logger.debug(
-                    "%suid=%s already in Gmail account %s (Message-ID) [%s]",
+                    "%suid=%s already delivered to %s (hash+dest) [%s]",
+                    prefix,
+                    uid,
+                    destination_key,
+                    account_id,
+                )
+            if already_here:
+                if state is not None and message_hash:
+                    state.record_hash_delivery(
+                        message_hash,
+                        destination_key,
+                        "already-present",
+                        account_id=account_id,
+                    )
+                logger.debug(
+                    "%suid=%s already in Gmail account %s [%s]",
                     prefix,
                     uid,
                     idx + 1,
@@ -161,6 +197,13 @@ def _deliver_to_gmail_destinations(
             any_imported = True
             if first_gmail_id is None:
                 first_gmail_id = gmail_id
+            if state is not None and message_hash:
+                state.record_hash_delivery(
+                    message_hash,
+                    destination_key,
+                    gmail_id,
+                    account_id=account_id,
+                )
             logger.info(
                 "%sImported uid=%s -> Gmail account %s id=%s [%s]",
                 prefix,
@@ -189,10 +232,6 @@ def _deliver_to_gmail_destinations(
             )
             all_succeeded = False
             break
-
-    # "Already had" only counts when we could verify via Message-ID on every dest.
-    if not message_id_header:
-        all_already_had = False
 
     return _DeliverResult(
         first_gmail_id=first_gmail_id,
@@ -266,7 +305,8 @@ def run_once(
     imported = 0
     skipped_duplicate = 0
     deleted = 0
-    gmail_contexts: list[tuple[Any, str | None, str, str]] = []
+    run_error: str | None = None
+    gmail_contexts: list[GmailContext] = []
     uid_validity = 0
 
     try:
@@ -335,8 +375,10 @@ def run_once(
                     raw=msg.raw,
                     uid=msg.uid,
                     account_id=acct_id,
+                    message_hash=msg.message_hash,
                     never_mark_spam=never_mark_spam,
                     mark_unread=True,
+                    state=state,
                 )
 
                 if deliver.skip_entire_message:
@@ -347,6 +389,11 @@ def run_once(
 
                 if not deliver.all_succeeded:
                     # Incomplete delivery: leave watermark so missing dests can retry.
+                    # Successful dests already recorded in hash_deliveries.
+                    run_error = (
+                        f"Incomplete Gmail delivery for uid={msg.uid} "
+                        f"(one or more destinations failed)"
+                    )
                     logger.warning(
                         "Stopping fetch run after incomplete delivery for uid=%s [%s]",
                         msg.uid,
@@ -381,6 +428,7 @@ def run_once(
                     continue
 
                 if not deliver.any_imported or deliver.first_gmail_id is None:
+                    run_error = f"Empty Gmail import result for uid={msg.uid}"
                     logger.warning(
                         "Stopping fetch run after empty import result for uid=%s [%s]",
                         msg.uid,
@@ -419,7 +467,7 @@ def run_once(
     last_fetch = state.get_last_fetch_time(mailbox, uid_validity, account_id=acct_id)
     state.close()
     return {
-        "error": None,
+        "error": run_error,
         "imported": imported,
         "skipped_duplicate": skipped_duplicate,
         "deleted": deleted,
@@ -486,7 +534,8 @@ def run_copy_all(
     imported = 0
     skipped_duplicate = 0
     deleted = 0
-    gmail_contexts: list[tuple[Any, str | None, str, str]] = []
+    run_error: str | None = None
+    gmail_contexts: list[GmailContext] = []
     uid_validity = 0
 
     try:
@@ -553,8 +602,10 @@ def run_copy_all(
                     raw=msg.raw,
                     uid=msg.uid,
                     account_id=acct_id,
+                    message_hash=msg.message_hash,
                     never_mark_spam=never_mark_spam,
                     mark_unread=not msg.is_seen,
+                    state=state,
                     log_prefix="Copy-all",
                 )
 
@@ -565,6 +616,11 @@ def run_copy_all(
                     continue
 
                 if not deliver.all_succeeded:
+                    # Successful dests already recorded in hash_deliveries for retry.
+                    run_error = (
+                        f"Incomplete Gmail delivery for uid={msg.uid} "
+                        f"(one or more destinations failed)"
+                    )
                     logger.warning(
                         "Stopping copy-all after incomplete delivery for uid=%s [%s]",
                         msg.uid,
@@ -599,6 +655,7 @@ def run_copy_all(
                     continue
 
                 if not deliver.any_imported and deliver.first_gmail_id is None:
+                    run_error = f"Empty Gmail import result for uid={msg.uid}"
                     logger.warning(
                         "Stopping copy-all after empty import result for uid=%s [%s]",
                         msg.uid,
@@ -637,7 +694,7 @@ def run_copy_all(
     last_fetch = state.get_last_fetch_time(mailbox, uid_validity, account_id=acct_id)
     state.close()
     return {
-        "error": None,
+        "error": run_error,
         "imported": imported,
         "skipped_duplicate": skipped_duplicate,
         "deleted": deleted,

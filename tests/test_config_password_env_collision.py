@@ -132,3 +132,133 @@ def test_replacement_password_keeps_custom_password_env(tmp_path, monkeypatch):
     acct = saved["imap_accounts"][0]
     assert acct["password_env"] == "ISP_SECRET"
     assert "password" not in acct
+
+
+def test_rejects_custom_password_env_collision_with_new_account(tmp_path, monkeypatch):
+    """Existing a with IMAP_PASSWORD_B must not allow adding b (same effective key)."""
+    cfg_path = tmp_path / "config.json"
+    cfg = {
+        "imap_accounts": [
+            {
+                "id": "a",
+                "host": "a.example.com",
+                "port": 993,
+                "username": "usera",
+                "password_env": "IMAP_PASSWORD_B",
+                "mailbox": "INBOX",
+            }
+        ],
+        "gmail_accounts": [{"token_path": "token.json"}],
+        "poll": {"interval_minutes": 5},
+        "state": {"db_path": "state.db"},
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setenv("FETCH2GMAIL_CONFIG", str(cfg_path))
+
+    update = ConfigUpdate(
+        imap_accounts=[
+            _acct("a", password=None, host="a.example.com", username="usera"),
+            _acct("b", password="secret-b", host="b.example.com", username="userb"),
+        ]
+    )
+    writes: list[tuple[str, str]] = []
+
+    with _config_api_stack(cfg_path, tmp_path, lambda _d, k, v: writes.append((k, v))):
+        with pytest.raises(HTTPException) as exc:
+            api_config_update(MagicMock(), update)
+
+    assert exc.value.status_code == 400
+    assert "IMAP_PASSWORD_B" in str(exc.value.detail)
+    assert writes == []
+    # Config unchanged
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert len(saved["imap_accounts"]) == 1
+    assert saved["imap_accounts"][0]["password_env"] == "IMAP_PASSWORD_B"
+
+
+def test_later_account_validation_failure_does_not_write_earlier_password(tmp_path, monkeypatch):
+    """If account B fails validation, account A's password must not be written."""
+    cfg_path = tmp_path / "config.json"
+    original = {
+        "imap_accounts": [
+            {
+                "id": "a",
+                "host": "old.example.com",
+                "port": 993,
+                "username": "olduser",
+                "password_env": "IMAP_PASSWORD_A",
+                "mailbox": "INBOX",
+            }
+        ],
+        "gmail_accounts": [{"token_path": "token.json"}],
+        "poll": {"interval_minutes": 5},
+        "state": {"db_path": "state.db"},
+    }
+    cfg_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("FETCH2GMAIL_CONFIG", str(cfg_path))
+
+    bad_b = _acct("b", password="secret-b", host="b.example.com", username="userb")
+    bad_b.since_date = "not-a-date"
+    update = ConfigUpdate(
+        imap_accounts=[
+            _acct(
+                "a",
+                password="secret-a",
+                host="new.example.com",
+                username="newuser",
+            ),
+            bad_b,
+        ]
+    )
+    writes: list[tuple[str, str]] = []
+
+    with _config_api_stack(cfg_path, tmp_path, lambda _d, k, v: writes.append((k, v))):
+        with pytest.raises(HTTPException) as exc:
+            api_config_update(MagicMock(), update)
+
+    assert exc.value.status_code == 400
+    assert "since_date" in str(exc.value.detail)
+    assert writes == []
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["imap_accounts"] == original["imap_accounts"]
+
+
+def test_routing_failure_after_password_verify_does_not_write(tmp_path, monkeypatch):
+    """Unknown gmail_token_paths must reject before any credential write."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "imap_accounts": [
+                    {
+                        "id": "a",
+                        "host": "a.example.com",
+                        "port": 993,
+                        "username": "u",
+                        "password_env": "IMAP_PASSWORD_A",
+                        "mailbox": "INBOX",
+                    }
+                ],
+                "gmail_accounts": [{"token_path": "token.json"}],
+                "poll": {"interval_minutes": 5},
+                "state": {"db_path": "state.db"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FETCH2GMAIL_CONFIG", str(cfg_path))
+
+    acct = _acct("a", password="secret-a", host="a.example.com", username="u")
+    acct.gmail_token_paths = ["missing-token.json"]
+    update = ConfigUpdate(imap_accounts=[acct])
+    writes: list[tuple[str, str]] = []
+
+    with _config_api_stack(cfg_path, tmp_path, lambda _d, k, v: writes.append((k, v))):
+        with pytest.raises(HTTPException) as exc:
+            api_config_update(MagicMock(), update)
+
+    assert exc.value.status_code == 400
+    assert "Unknown gmail_token_path" in str(exc.value.detail) or "missing-token" in str(
+        exc.value.detail
+    )
+    assert writes == []

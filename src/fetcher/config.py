@@ -34,24 +34,47 @@ def password_env_for_account_id(account_id: str) -> str:
     return password_env_key_for_account_id(acct_id)
 
 
-def validate_unique_password_env_keys(account_ids: list[str]) -> None:
+def effective_password_env(
+    account_id: str,
+    existing: dict[str, Any] | None = None,
+) -> str:
     """
-    Raise ValueError if distinct account ids derive the same credential key.
+    Credential env key that will be used when saving this account.
 
-    IDs that differ only by punctuation or letter case (e.g. my-isp / my_isp / MY_ISP)
-    all map to IMAP_PASSWORD_MY_ISP and must not be saved together.
+    Preserves an existing custom password_env when present; otherwise derives
+    from the account id.
     """
+    if existing:
+        custom = str(existing.get("password_env") or "").strip()
+        if custom:
+            return custom
+    return password_env_for_account_id(account_id)
+
+
+def validate_unique_password_env_keys(
+    account_ids: list[str],
+    *,
+    existing_by_id: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """
+    Raise ValueError if two accounts would share the same effective credential key.
+
+    Checks both derived keys (my-isp / my_isp → IMAP_PASSWORD_MY_ISP) and
+    preserved custom password_env values (e.g. existing account a with
+    IMAP_PASSWORD_B colliding with new account b).
+    """
+    existing_by_id = existing_by_id or {}
     seen: dict[str, str] = {}
     for raw in account_ids:
         acct_id = (raw or "").strip()
         if not acct_id:
             continue
-        key = password_env_for_account_id(acct_id)
+        key = effective_password_env(acct_id, existing_by_id.get(acct_id))
         prev = seen.get(key)
         if prev is not None and prev != acct_id:
             raise ValueError(
-                f"IMAP account ids {prev!r} and {acct_id!r} both map to credential key {key}; "
-                "choose ids that differ by more than punctuation or letter case"
+                f"IMAP account ids {prev!r} and {acct_id!r} both use credential key {key}; "
+                "choose a different id or update the existing account's password_env first"
             )
         seen[key] = acct_id
 
@@ -203,10 +226,14 @@ def get_imap_account(cfg: dict[str, Any], account_id: str | None = None) -> dict
     raise ValueError(f"Unknown IMAP account id: {account_id!r}")
 
 
-def _normalize_token_path(token_path: str | Path) -> str:
-    """Normalize token path for comparison (use basename when relative-looking)."""
-    p = Path(str(token_path).strip())
-    return p.name if not p.is_absolute() else str(p)
+def _token_path_identity(token_path: str | Path) -> str:
+    """
+    Full token-path identity for route matching and pruning.
+
+    Uses the configured path string (stripped), not the basename — so
+    old/token.json and other/token.json remain distinct destinations.
+    """
+    return str(token_path).strip()
 
 
 def get_gmail_destinations_for_imap(
@@ -217,7 +244,8 @@ def get_gmail_destinations_for_imap(
     Resolve Gmail destinations for one IMAP account.
 
     If gmail_token_paths is omitted or empty → all gmail_accounts.
-    Otherwise → only matching token_path entries. Unknown paths raise ValueError.
+    Otherwise → only matching token_path entries (full-path identity).
+    Unknown paths raise ValueError.
     """
     all_gmail = get_gmail_accounts(cfg)
     raw_paths = imap_account.get("gmail_token_paths")
@@ -226,26 +254,25 @@ def get_gmail_destinations_for_imap(
     if not isinstance(raw_paths, list):
         raise ValueError("gmail_token_paths must be a list of token_path strings")
 
-    by_name: dict[str, dict[str, Any]] = {}
-    by_full: dict[str, dict[str, Any]] = {}
+    by_path: dict[str, dict[str, Any]] = {}
     for acct in all_gmail:
-        tp = str(acct.get("token_path", "token.json")).strip()
-        by_full[tp] = acct
-        by_name[_normalize_token_path(tp)] = acct
+        tp = _token_path_identity(acct.get("token_path", "token.json"))
+        if tp:
+            by_path[tp] = acct
 
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_paths:
-        key = str(raw).strip()
+        key = _token_path_identity(raw)
         if not key:
             continue
-        match = by_full.get(key) or by_name.get(_normalize_token_path(key))
+        match = by_path.get(key)
         if match is None:
             raise ValueError(
                 f"Unknown gmail_token_path {key!r} for IMAP account "
                 f"{imap_account.get('id')!r}; not found in gmail_accounts"
             )
-        marker = str(match.get("token_path", key))
+        marker = _token_path_identity(match.get("token_path", key))
         if marker in seen:
             continue
         seen.add(marker)
@@ -258,16 +285,20 @@ def get_gmail_destinations_for_imap(
 
 def prune_stale_gmail_routes(
     imap_accounts: list[dict[str, Any]],
-    valid_token_names: set[str],
+    valid_token_paths: set[str],
 ) -> None:
     """
     Remove gmail_token_paths entries that are no longer in gmail_accounts.
 
-    Mutates imap_accounts in place. An omitted or already-empty route (meaning
-    "all destinations") is left alone. If an *explicit* non-empty route would
-    become empty after pruning, raise ValueError — empty means "all remaining
-    Gmail accounts", which would silently broaden the user's selection.
+    valid_token_paths must be full token-path identities as stored in
+    gmail_accounts (not basenames). Mutates imap_accounts in place.
+
+    An omitted or already-empty route (meaning "all destinations") is left
+    alone. If an *explicit* non-empty route would become empty after pruning,
+    raise ValueError — empty means "all remaining Gmail accounts", which would
+    silently redirect mail to the wrong destination(s).
     """
+    valid = {_token_path_identity(p) for p in valid_token_paths if str(p).strip()}
     updates: list[tuple[dict[str, Any], list[Any]]] = []
     for acct in imap_accounts:
         paths = acct.get("gmail_token_paths")
@@ -276,11 +307,7 @@ def prune_stale_gmail_routes(
         pruned = [
             p
             for p in paths
-            if str(p).strip()
-            and (
-                _normalize_token_path(p) in valid_token_names
-                or str(p).strip() in valid_token_names
-            )
+            if _token_path_identity(p) and _token_path_identity(p) in valid
         ]
         if not pruned:
             raise ValueError(
