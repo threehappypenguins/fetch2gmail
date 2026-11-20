@@ -35,56 +35,81 @@ _TCP_KEEPCNT = 5
 
 # Coordinate releasing the long-lived IDLE connection during imports so ISP
 # accounts limited to 2 concurrent IMAP sessions can still fetch+delete.
-_idle_gate = threading.Condition()
-_idle_suspend_count = 0
-_idle_connection_held = False
+# Gates are per account_id so different IMAP servers do not block each other.
+_DEFAULT_IDLE_ACCOUNT = "default"
+_idle_gates_lock = threading.Lock()
+_idle_gates: dict[str, threading.Condition] = {}
+_idle_suspend_counts: dict[str, int] = {}
+_idle_connection_held: dict[str, bool] = {}
 
 
-def _idle_suspend_requested() -> bool:
-    with _idle_gate:
-        return _idle_suspend_count > 0
+def _normalize_account_id(account_id: str | None) -> str:
+    aid = (account_id or "").strip()
+    return aid or _DEFAULT_IDLE_ACCOUNT
 
 
-def _set_idle_connection_held(held: bool) -> None:
-    global _idle_connection_held
-    with _idle_gate:
-        _idle_connection_held = held
-        _idle_gate.notify_all()
+def _gate_for(account_id: str | None) -> tuple[str, threading.Condition]:
+    aid = _normalize_account_id(account_id)
+    with _idle_gates_lock:
+        if aid not in _idle_gates:
+            _idle_gates[aid] = threading.Condition()
+            _idle_suspend_counts[aid] = 0
+            _idle_connection_held[aid] = False
+        return aid, _idle_gates[aid]
 
 
-def _wait_until_idle_allowed(stop_event: threading.Event) -> bool:
-    """Block while imports have paused IDLE. Return False if stop was requested."""
+def _idle_suspend_requested(account_id: str | None = None) -> bool:
+    aid, gate = _gate_for(account_id)
+    with gate:
+        return _idle_suspend_counts.get(aid, 0) > 0
+
+
+def _set_idle_connection_held(held: bool, account_id: str | None = None) -> None:
+    aid, gate = _gate_for(account_id)
+    with gate:
+        _idle_connection_held[aid] = held
+        gate.notify_all()
+
+
+def _wait_until_idle_allowed(
+    stop_event: threading.Event,
+    account_id: str | None = None,
+) -> bool:
+    """Block while imports have paused IDLE for this account. Return False if stop was requested."""
+    aid, gate = _gate_for(account_id)
     while not stop_event.is_set():
-        with _idle_gate:
-            if _idle_suspend_count == 0:
+        with gate:
+            if _idle_suspend_counts.get(aid, 0) == 0:
                 return True
-            _idle_gate.wait(timeout=0.5)
+            gate.wait(timeout=0.5)
     return False
 
 
 @contextmanager
-def pause_idle_connection(timeout_seconds: float = 60.0) -> Iterator[None]:
+def pause_idle_connection(
+    timeout_seconds: float = 60.0,
+    account_id: str | None = None,
+) -> Iterator[None]:
     """
-    Drop (or wait for) the IDLE watcher connection for the duration of an import.
+    Drop (or wait for) the IDLE watcher connection for one IMAP account during an import.
 
     Use around run_once / run_copy_all so manual UI fetches do not compete with IDLE
-    for scarce IMAP connection slots.
+    for scarce IMAP connection slots on that same account.
     """
-    global _idle_suspend_count
-    with _idle_gate:
-        _idle_suspend_count += 1
-        _idle_gate.notify_all()
+    aid, gate = _gate_for(account_id)
+    with gate:
+        _idle_suspend_counts[aid] = _idle_suspend_counts.get(aid, 0) + 1
+        gate.notify_all()
         deadline = time.monotonic() + max(1.0, timeout_seconds)
-        while _idle_connection_held and time.monotonic() < deadline:
+        while _idle_connection_held.get(aid, False) and time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            _idle_gate.wait(timeout=min(0.5, max(0.05, remaining)))
+            gate.wait(timeout=min(0.5, max(0.05, remaining)))
     try:
         yield
     finally:
-        with _idle_gate:
-            _idle_suspend_count = max(0, _idle_suspend_count - 1)
-            _idle_gate.notify_all()
-
+        with gate:
+            _idle_suspend_counts[aid] = max(0, _idle_suspend_counts.get(aid, 0) - 1)
+            gate.notify_all()
 
 def server_supports_idle(capabilities: Any) -> bool:
     """Return True if CAPABILITY list includes IDLE (bytes or str tokens)."""
@@ -462,6 +487,7 @@ def watcher_loop(
         poll_interval_minutes = max(1, int(settings.get("poll_interval_minutes", 5)))
         idle_refresh_seconds = float(idle_refresh_minutes * 60)
         poll_interval_seconds = float(poll_interval_minutes * 60)
+        account_id = _normalize_account_id(settings.get("account_id"))
         conn_id = connection_identity(settings)
 
         client: IMAPClient | None = None
@@ -510,7 +536,7 @@ def watcher_loop(
                             break
 
                     while not stop_event.is_set():
-                        if not _wait_until_idle_allowed(stop_event):
+                        if not _wait_until_idle_allowed(stop_event, account_id):
                             break
                         # Re-read settings in case host/mailbox changed during import.
                         try:
@@ -523,7 +549,8 @@ def watcher_loop(
                                 break
                             if not bool(refreshed.get("use_idle", True)):
                                 logger.info(
-                                    "IDLE disabled in config; switching to poll mode"
+                                    "IDLE disabled in config [%s]; switching to poll mode",
+                                    account_id,
                                 )
                                 break
                             idle_refresh_minutes = max(
@@ -541,6 +568,9 @@ def watcher_loop(
                             password = refreshed["password"]
                             mailbox = refreshed.get("mailbox") or "INBOX"
                             use_ssl = bool(refreshed.get("use_ssl", True))
+                            account_id = _normalize_account_id(
+                                refreshed.get("account_id") or account_id
+                            )
                             conn_id = connection_identity(refreshed)
 
                         client = connect_idle_client(
@@ -553,12 +583,12 @@ def watcher_loop(
                         )
                         idle_conn_id = conn_id
                         leave_idle = False
-                        _set_idle_connection_held(True)
+                        _set_idle_connection_held(True, account_id)
 
                         def _idle_should_abort() -> bool:
                             nonlocal idle_refresh_minutes, idle_refresh_seconds
                             nonlocal no_idle_conn_id, leave_idle
-                            if _idle_suspend_requested():
+                            if _idle_suspend_requested(account_id):
                                 leave_idle = True
                                 return True
                             refreshed_inner = load_imap_settings()
@@ -575,14 +605,16 @@ def watcher_loop(
                             idle_refresh_seconds = float(idle_refresh_minutes * 60)
                             if connection_identity(refreshed_inner) != idle_conn_id:
                                 logger.info(
-                                    "IMAP connection settings changed; reconnecting IDLE watcher"
+                                    "IMAP connection settings changed [%s]; reconnecting IDLE watcher",
+                                    account_id,
                                 )
                                 no_idle_conn_id = None
                                 leave_idle = True
                                 return True
                             if not bool(refreshed_inner.get("use_idle", True)):
                                 logger.info(
-                                    "IDLE disabled in config; switching to poll mode"
+                                    "IDLE disabled in config [%s]; switching to poll mode",
+                                    account_id,
                                 )
                                 leave_idle = True
                                 return True
@@ -639,15 +671,15 @@ def watcher_loop(
                         finally:
                             _close_client(client)
                             client = None
-                            _set_idle_connection_held(False)
+                            _set_idle_connection_held(False, account_id)
 
                         if stop_event.is_set():
                             break
                         if leave_idle and not need_fetch:
                             # Suspend, settings change, or IDLE disabled without a mailbox wake.
-                            if _idle_suspend_requested():
+                            if _idle_suspend_requested(account_id):
                                 # Wait for the import that paused us, then resume IDLE.
-                                if not _wait_until_idle_allowed(stop_event):
+                                if not _wait_until_idle_allowed(stop_event, account_id):
                                     break
                                 continue
                             break

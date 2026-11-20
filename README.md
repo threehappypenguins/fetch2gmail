@@ -2,8 +2,9 @@
 
 Self-hosted email fetcher: **IMAP (ISP mailbox) → Gmail API import**. Replaces Gmail’s deprecated POP3 fetch.
 
-- Watches an ISP mailbox via **IMAPS** (port 993), using **IMAP IDLE** for near-realtime delivery when the server supports it (falls back to polling otherwise).
+- Watches one or more ISP mailboxes via **IMAPS** (port 993), using **IMAP IDLE** for near-realtime delivery when the server supports it (falls back to polling otherwise).
 - Imports messages with **Gmail API** (not SMTP); applies a Gmail label, preserves headers and date. By default uses **`neverMarkSpam`** so Gmail’s spam classifier does not bury ISP→Gmail imports.
+- Supports **multiple IMAP accounts in one process**, with optional **per-IMAP routing** to one or more Gmail accounts.
 - Deletes from ISP only after Gmail confirms import. **Idempotent** (UID + message hash).
 
 **Requirements:** Python 3.11+, IMAP credentials, Google Cloud project with Gmail API and OAuth2 (Web application).
@@ -202,39 +203,72 @@ All app files live in **one directory**: **config.json**, **credentials.json**, 
 - The UI is protected by a username and password in **.ui_auth** (when set). Get **token.json** via **`fetch2gmail auth`** (CLI only; there is no "Sign in with Google" in the UI).
 - The Gmail scope requested is **gmail.modify** (read and modify labels/messages only).
 
-### Multiple accounts (multiple instances)
+### Multiple IMAP accounts (recommended: one process)
 
-One instance = one IMAP mailbox → one Gmail account. To run **multiple accounts** (e.g. two ISP mailboxes forwarding to two Gmail addresses), run **multiple instances**, each with its own data directory and **its own port** so the UIs don’t conflict.
+One Fetch2Gmail process can watch **multiple IMAP mailboxes** and import into one or more Gmail accounts. Configure this in the UI (**IMAP accounts** section) or in **config.json** via `imap_accounts`.
+
+**Example: 3 IMAP → 1 Gmail**
+
+```json
+{
+  "imap_accounts": [
+    {
+      "id": "isp1",
+      "host": "imap.isp1.example",
+      "port": 993,
+      "username": "you@isp1.example",
+      "password_env": "IMAP_PASSWORD_ISP1",
+      "mailbox": "INBOX",
+      "use_ssl": true,
+      "delete_after_import": true,
+      "gmail_token_paths": []
+    },
+    {
+      "id": "isp2",
+      "host": "imap.isp2.example",
+      "username": "you@isp2.example",
+      "password_env": "IMAP_PASSWORD_ISP2",
+      "mailbox": "INBOX"
+    },
+    {
+      "id": "isp3",
+      "host": "imap.isp3.example",
+      "username": "you@isp3.example",
+      "password_env": "IMAP_PASSWORD_ISP3",
+      "mailbox": "INBOX"
+    }
+  ],
+  "gmail_accounts": [
+    {
+      "label": "ISP Mail",
+      "credentials_path": "credentials.json",
+      "token_path": "token.json"
+    }
+  ]
+}
+```
+
+- Leave `gmail_token_paths` empty (or omit it) so that IMAP account imports into **all** configured Gmail accounts.
+- To route one IMAP account to a subset of Gmail accounts, set `gmail_token_paths` to the matching `token_path` values (e.g. `["token.json"]`).
+- Passwords are stored encrypted in **.env** under each account’s `password_env` key (default `IMAP_PASSWORD` for id `default`, otherwise `IMAP_PASSWORD_<ID>`).
+- Legacy configs with a single top-level `"imap"` object still work (treated as one account with id `default`).
+
+In the UI you can add/remove IMAP accounts and pick Gmail destinations per account. One systemd service / one UI port is enough.
+
+### Multiple instances (optional isolation)
+
+You can still run **multiple processes** (separate data directories and ports) when you want isolation across machines or fully separate configs. That is optional now that multi-IMAP works in one process.
 
 **Second instance (example):**
 
-1. Create a second data directory and put config and credentials there (e.g. `/opt/fetch2gmail2` with its own **config.json**, **credentials.json**, **token.json**, **.env**). Use the same GCP **credentials.json** if you like; get a separate **token.json** for the second Gmail account (run `fetch2gmail auth` and sign in with the second Gmail, then copy that **token.json** into the second directory).
-
-2. Generate a second systemd unit with a **different port** and unit name:
+1. Create a second data directory (e.g. `/opt/fetch2gmail2`) with its own **config.json**, credentials, and tokens.
+2. Generate a second systemd unit and bind a different port:
    ```bash
    fetch2gmail install-service --user YOUR_USER --dir /opt/fetch2gmail2 -o /tmp/fetch2gmail2.service
-   ```
-
-3. Install the second unit under a different name so both can run, **then edit its ExecStart to add a port**:
-   ```bash
    sudo mv /tmp/fetch2gmail2.service /etc/systemd/system/fetch2gmail2.service
-   sudo nano /etc/systemd/system/fetch2gmail2.service
    ```
-   In the editor, find the `ExecStart=` line and make sure it includes a port flag, for example:
-   ```
-   ExecStart=/home/YOUR_USER/.local/pipx/venvs/fetch2gmail/bin/fetch2gmail serve --host 0.0.0.0 --port 8766
-   ```
-   Also set **WorkingDirectory** and **Environment=FETCH2GMAIL_CONFIG** to the second directory (e.g. `/opt/fetch2gmail2`, `/opt/fetch2gmail2/config.json`). Then reload and enable:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable fetch2gmail2
-   sudo systemctl start fetch2gmail2
-   ```
-   Run **`fetch2gmail set-ui-password`** once from the second directory (or with **FETCH2GMAIL_CONFIG** set to the second config) so the second UI is protected.
-
-4. Open the first UI at **http://server:8765** and the second at **http://server:8766**. Each has its own config, token, and poller.
-
-**You need a different port per instance** — each `fetch2gmail serve` binds to one port, so a second instance must use `--port 8766` (or another free port).
+   Edit `ExecStart=` to include `--port 8766`, then enable/start `fetch2gmail2`.
+3. Open the first UI at **http://server:8765** and the second at **http://server:8766**.
 
 ### Troubleshooting
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .gmail_client import SCOPES
+from .gmail_client import SCOPES, atomic_write_token
 
 # Single-purpose app: no config, no session, just OAuth -> save token
 app = FastAPI(
@@ -91,9 +91,7 @@ def _auth_callback(
     flow.redirect_uri = f"{callback_base}/auth/gmail/callback"
     flow.fetch_token(code=code)
     creds = flow.credentials
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(token_path, "w", encoding="utf-8") as f:
-        f.write(creds.to_json())
+    atomic_write_token(token_path, creds.to_json())
 
     cred_abs = cred_path.resolve()
     tok_abs = token_path.resolve()

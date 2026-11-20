@@ -4,8 +4,13 @@ Gmail API client: import messages (users.messages.import), preserve headers/date
 Uses OAuth2 refresh token. Exponential backoff on transient errors.
 """
 
+from __future__ import annotations
+
 import base64
 import logging
+import os
+import tempfile
+import threading
 import time
 from email import policy
 from email.parser import BytesParser
@@ -27,32 +32,83 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
+# Serialize load/refresh/persist per resolved token path so concurrent IMAP workers
+# sharing a Gmail destination cannot race on the same token.json.
+_token_locks_guard = threading.Lock()
+_token_locks: dict[str, threading.Lock] = {}
+
+
+def _token_lock_key(token_path: Path) -> str:
+    """Stable lock key for a token file (absolute, resolved when possible)."""
+    try:
+        return str(token_path.resolve())
+    except OSError:
+        return str(token_path.absolute())
+
+
+def _lock_for_token(token_path: Path) -> threading.Lock:
+    key = _token_lock_key(token_path)
+    with _token_locks_guard:
+        lock = _token_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _token_locks[key] = lock
+        return lock
+
+
+def atomic_write_token(token_path: Path | str, content: str) -> None:
+    """Replace token file atomically (temp file in same dir + os.replace)."""
+    path = Path(token_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
 
 def get_gmail_service(credentials_path: str | Path, token_path: str | Path):
     """
     Build Gmail API service using stored credentials and token.
     Refreshes access token from refresh token when needed (no interactive login after setup).
+
+    Credential load/refresh/persistence for a given token path is serialized so concurrent
+    callers (e.g. multiple IMAP accounts routing to the same Gmail destination) cannot
+    observe a truncated token file mid-write.
     """
     cred_path = Path(credentials_path)
     tok_path = Path(token_path)
-    creds = None
-    if tok_path.exists():
-        creds = Credentials.from_authorized_user_file(str(tok_path), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not cred_path.exists():
-                raise FileNotFoundError(
-                    f"Credentials file not found: {cred_path}. "
-                    "Create OAuth client and download credentials.json. See README."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(str(cred_path), SCOPES)
-            # For headless: run local server once to get refresh token, then save token.json
-            creds = flow.run_local_server(port=0)
-        with open(tok_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    with _lock_for_token(tok_path):
+        creds = None
+        if tok_path.exists():
+            # Re-read under the lock: another waiter may have just refreshed.
+            creds = Credentials.from_authorized_user_file(str(tok_path), SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                if not cred_path.exists():
+                    raise FileNotFoundError(
+                        f"Credentials file not found: {cred_path}. "
+                        "Create OAuth client and download credentials.json. See README."
+                    )
+                flow = InstalledAppFlow.from_client_secrets_file(str(cred_path), SCOPES)
+                # For headless: run local server once to get refresh token, then save token.json
+                creds = flow.run_local_server(port=0)
+            atomic_write_token(tok_path, creds.to_json())
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 def _normalize_from_header(raw: bytes) -> bytes:

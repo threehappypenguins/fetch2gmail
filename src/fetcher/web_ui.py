@@ -22,37 +22,78 @@ from pydantic import BaseModel
 
 import imaplib
 
-from .config import get_config_path, get_gmail_accounts, load_config
+from .config import (
+    DEFAULT_IMAP_ACCOUNT_ID,
+    get_config_path,
+    get_gmail_accounts,
+    get_gmail_destinations_for_imap,
+    get_imap_accounts,
+    load_config,
+    effective_password_env,
+    password_env_for_account_id,
+    validate_unique_password_env_keys,
+    prune_stale_gmail_routes,
+)
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
 from .idle_watcher import pause_idle_connection, watcher_loop
 from .imap_client import get_uid_validity
 from .log_buffer import get_recent_logs, install_log_buffer
-from .run import run_once, run_copy_all, setup_logging
+from .run import destination_keys_for_token_invalidation, run_once, run_copy_all, setup_logging
 from .state import StateStore
 from .ui_auth import create_ui_auth, load_ui_auth, verify_ui_auth
 
 logger = logging.getLogger(__name__)
 
-# Prevents overlapping imports (IDLE wake, poll fallback, manual fetch, copy-all).
-_fetch_lock = threading.Lock()
-# Back-compat alias used by copy-all path.
-_copy_all_lock = _fetch_lock
+# Per-IMAP-account fetch locks (IDLE wake, poll fallback, manual fetch, copy-all).
+_fetch_locks_guard = threading.Lock()
+_fetch_locks: dict[str, threading.Lock] = {}
+
+# Watcher manager: one thread per IMAP account id.
+_watcher_manager_lock = threading.Lock()
+_watcher_stop_events: dict[str, threading.Event] = {}
+_watcher_threads: dict[str, threading.Thread] = {}
+_watcher_supervisor_stop: threading.Event | None = None
+_watcher_supervisor_thread: threading.Thread | None = None
 
 
-def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
-    """Return IMAP + poll/IDLE settings for the watcher, or None if not ready."""
+def _fetch_lock_for(account_id: str) -> threading.Lock:
+    aid = (account_id or DEFAULT_IMAP_ACCOUNT_ID).strip() or DEFAULT_IMAP_ACCOUNT_ID
+    with _fetch_locks_guard:
+        if aid not in _fetch_locks:
+            _fetch_locks[aid] = threading.Lock()
+        return _fetch_locks[aid]
+
+
+def _load_imap_settings_for_account(account_id: str) -> dict[str, Any] | None:
+    """Return IMAP + poll/IDLE settings for one account, or None if not ready."""
     if not _config_exists():
         return None
     path = _get_config_path()
-    cfg = load_config(path, resolve_password=True)
-    imap = cfg.get("imap") or {}
+    # Resolve only this account's password so a broken sibling cannot stop us.
+    try:
+        cfg = load_config(path, resolve_password=True, account_id=account_id)
+    except ValueError as e:
+        logger.warning("IMAP settings for %s skipped: %s", account_id, e)
+        return None
+    try:
+        accounts = get_imap_accounts(cfg)
+    except ValueError:
+        return None
+    imap = None
+    for acct in accounts:
+        if str(acct.get("id")) == account_id:
+            imap = acct
+            break
+    if not imap:
+        return None
     if not imap.get("host") or not imap.get("username") or not imap.get("password"):
         return None
     since_date = imap.get("since_date")
     if since_date == "":
         since_date = None
     return {
+        "account_id": account_id,
         "host": imap["host"],
         "port": int(imap.get("port", 993)),
         "username": imap["username"],
@@ -68,7 +109,9 @@ def _load_imap_settings_for_watcher() -> dict[str, Any] | None:
     }
 
 
-def _watcher_last_processed_uid(mailbox: str, uid_validity: int) -> int | None:
+def _watcher_last_processed_uid_for(
+    account_id: str, mailbox: str, uid_validity: int
+) -> int | None:
     """Read last_processed_uid from state.db for pre-IDLE pending-mail checks."""
     if not _config_exists():
         return None
@@ -82,66 +125,156 @@ def _watcher_last_processed_uid(mailbox: str, uid_validity: int) -> int | None:
     state = StateStore(str(db_path))
     try:
         state.connect()
-        return state.get_last_processed_uid(mailbox, uid_validity)
+        return state.get_last_processed_uid(
+            mailbox, uid_validity, account_id=account_id
+        )
     finally:
         state.close()
 
 
-def _run_once_locked(config_path: str, dry_run: bool = False) -> dict[str, Any]:
-    """Run one fetch cycle under the shared fetch lock (IDLE connection paused)."""
-    with _fetch_lock:
-        with pause_idle_connection():
-            return run_once(config_path=config_path, dry_run=dry_run)
+def _run_once_locked(
+    config_path: str,
+    dry_run: bool = False,
+    account_id: str | None = None,
+) -> dict[str, Any]:
+    """Run one fetch cycle under the per-account fetch lock (IDLE connection paused)."""
+    aid = account_id or DEFAULT_IMAP_ACCOUNT_ID
+    with _fetch_lock_for(aid):
+        with pause_idle_connection(account_id=aid):
+            return run_once(
+                config_path=config_path, dry_run=dry_run, account_id=account_id
+            )
 
 
-def _watcher_on_fetch() -> bool:
-    """Callback for IDLE/poll wakes: run import once; return True on success."""
+def _watcher_on_fetch_for(account_id: str) -> bool:
+    """Callback for IDLE/poll wakes for one account; return True on success."""
     try:
         path = _get_config_path()
         setup_logging()
         install_log_buffer()
-        result = _run_once_locked(config_path=str(path), dry_run=False)
+        result = _run_once_locked(
+            config_path=str(path), dry_run=False, account_id=account_id
+        )
         if result.get("error"):
-            logger.warning("Background fetch error: %s", result["error"])
+            logger.warning(
+                "Background fetch error [%s]: %s", account_id, result["error"]
+            )
             return False
         logger.info(
-            "Background fetch: imported=%s skipped=%s deleted=%s",
+            "Background fetch [%s]: imported=%s skipped=%s deleted=%s",
+            account_id,
             result.get("imported", 0),
             result.get("skipped_duplicate", 0),
             result.get("deleted", 0),
         )
         return True
     except ValueError as e:
-        logger.warning("Background fetch skipped: %s", e)
+        logger.warning("Background fetch skipped [%s]: %s", account_id, e)
         return False
     except Exception as e:
-        logger.exception("Background fetch failed: %s", e)
+        logger.exception("Background fetch failed [%s]: %s", account_id, e)
         return False
 
 
-def _watcher_thread_main(stop_event: threading.Event) -> None:
-    """Background thread: IMAP IDLE with polling fallback."""
+def _watcher_thread_main(stop_event: threading.Event, account_id: str) -> None:
+    """Background thread: IMAP IDLE with polling fallback for one account."""
     watcher_loop(
         stop_event,
-        load_imap_settings=_load_imap_settings_for_watcher,
-        on_fetch=_watcher_on_fetch,
-        get_last_processed_uid=_watcher_last_processed_uid,
+        load_imap_settings=lambda: _load_imap_settings_for_account(account_id),
+        on_fetch=lambda: _watcher_on_fetch_for(account_id),
+        get_last_processed_uid=lambda mailbox, uid_validity: _watcher_last_processed_uid_for(
+            account_id, mailbox, uid_validity
+        ),
     )
+
+
+def _desired_watcher_account_ids() -> list[str]:
+    if not _config_exists():
+        return []
+    try:
+        cfg = load_config(_get_config_path(), resolve_password=False)
+        return [
+            str(a.get("id") or DEFAULT_IMAP_ACCOUNT_ID) for a in get_imap_accounts(cfg)
+        ]
+    except Exception:
+        return []
+
+
+def _sync_watcher_threads() -> None:
+    """Start/stop watcher threads so they match configured IMAP account ids."""
+    desired = set(_desired_watcher_account_ids())
+    with _watcher_manager_lock:
+        # Stop removed accounts
+        for aid in list(_watcher_threads.keys()):
+            if aid in desired:
+                continue
+            stop_ev = _watcher_stop_events.pop(aid, None)
+            thread = _watcher_threads.pop(aid, None)
+            if stop_ev:
+                stop_ev.set()
+            if thread and thread.is_alive():
+                thread.join(timeout=5)
+            logger.info("Stopped IMAP watcher for account %s", aid)
+        # Start new accounts
+        for aid in desired:
+            existing = _watcher_threads.get(aid)
+            if existing and existing.is_alive():
+                continue
+            stop_ev = threading.Event()
+            thread = threading.Thread(
+                target=_watcher_thread_main,
+                args=(stop_ev, aid),
+                daemon=True,
+                name=f"imap-watcher-{aid}",
+            )
+            _watcher_stop_events[aid] = stop_ev
+            _watcher_threads[aid] = thread
+            thread.start()
+            logger.info("Started IMAP watcher for account %s", aid)
+
+
+def _watcher_supervisor_main(stop_event: threading.Event) -> None:
+    """Periodically reconcile watcher threads with config (add/remove accounts)."""
+    while not stop_event.is_set():
+        try:
+            _sync_watcher_threads()
+        except Exception:
+            logger.exception("Watcher supervisor sync failed")
+        stop_event.wait(timeout=15.0)
+
+
+def _stop_all_watchers() -> None:
+    with _watcher_manager_lock:
+        for stop_ev in _watcher_stop_events.values():
+            stop_ev.set()
+        threads = list(_watcher_threads.values())
+        _watcher_stop_events.clear()
+        _watcher_threads.clear()
+    for thread in threads:
+        thread.join(timeout=10)
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    stop_event = threading.Event()
-    watcher = threading.Thread(
-        target=_watcher_thread_main, args=(stop_event,), daemon=True
+    global _watcher_supervisor_stop, _watcher_supervisor_thread
+    _watcher_supervisor_stop = threading.Event()
+    _sync_watcher_threads()
+    _watcher_supervisor_thread = threading.Thread(
+        target=_watcher_supervisor_main,
+        args=(_watcher_supervisor_stop,),
+        daemon=True,
+        name="imap-watcher-supervisor",
     )
-    watcher.start()
+    _watcher_supervisor_thread.start()
     logger.info(
-        "Background IMAP watcher started (IDLE when supported; else poll_interval_minutes)"
+        "Background IMAP watchers started (one IDLE/poll thread per IMAP account)"
     )
     yield
-    stop_event.set()
-    watcher.join(timeout=20)
+    if _watcher_supervisor_stop:
+        _watcher_supervisor_stop.set()
+    if _watcher_supervisor_thread:
+        _watcher_supervisor_thread.join(timeout=5)
+    _stop_all_watchers()
 
 
 app = FastAPI(title="Fetch2Gmail", description="IMAP to Gmail import service", lifespan=_lifespan)
@@ -258,7 +391,7 @@ def _can_set_ui_password() -> bool:
     return bool(cfg_dir and not load_ui_auth(cfg_dir))
 
 
-# Sanitized config for UI (no passwords, no token paths)
+# Sanitized config for UI (no passwords)
 class ImapConfigSafe(BaseModel):
     host: str
     port: int
@@ -270,6 +403,23 @@ class ImapConfigSafe(BaseModel):
     use_idle: bool = True
     idle_refresh_minutes: int = 25
     never_mark_spam: bool = True
+
+
+class ImapAccountSafe(BaseModel):
+    id: str
+    host: str
+    port: int = 993
+    username: str
+    mailbox: str = "INBOX"
+    use_ssl: bool = True
+    delete_after_import: bool = True
+    since_date: str | None = None
+    use_idle: bool = True
+    idle_refresh_minutes: int = 25
+    never_mark_spam: bool = True
+    password_env: str = "IMAP_PASSWORD"
+    password_set: bool = False
+    gmail_token_paths: list[str] = []
 
 
 class GmailConfigSafe(BaseModel):
@@ -292,7 +442,8 @@ class UIConfigSafe(BaseModel):
 
 
 class ConfigResponse(BaseModel):
-    imap: ImapConfigSafe
+    imap: ImapConfigSafe  # first/legacy account for back-compat
+    imap_accounts: list[ImapAccountSafe] = []
     gmail: GmailConfigSafe
     gmail_accounts: list[GmailAccountSafe] = []
     ui: UIConfigSafe
@@ -303,7 +454,6 @@ class ConfigResponse(BaseModel):
     config_exists: bool = True  # False when config.json not created yet (show setup wizard)
     show_set_password_wizard: bool = False  # True when no .ui_auth → show wizard (must set password before using app)
     ui_password_mode: bool = False  # True when .ui_auth exists → show "Change password" on dashboard
-
 
 @app.get("/static/app.js", response_model=None)
 def static_app_js():
@@ -420,19 +570,50 @@ def _gmail_email() -> str | None:
         return None
 
 
+def _imap_account_password_set(imap: dict[str, Any]) -> bool:
+    if imap.get("password") not in (None, ""):
+        return True
+    acct_id = str(imap.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+    key = imap.get("password_env") or password_env_for_account_id(acct_id)
+    return bool(os.environ.get(key) or os.environ.get(f"{key}_ENC"))
+
+
 def _imap_password_set() -> bool:
     path = _get_config_path()
     if not path.exists():
         return False
     try:
         cfg = load_config(path, resolve_password=False)
-        imap = cfg.get("imap") or {}
-        if imap.get("password") not in (None, ""):
-            return True
-        key = imap.get("password_env", "IMAP_PASSWORD")
-        return bool(os.environ.get(key) or os.environ.get(f"{key}_ENC"))
+        accounts = get_imap_accounts(cfg)
+        if not accounts:
+            return False
+        return all(_imap_account_password_set(a) for a in accounts)
     except Exception:
         return False
+
+
+def _imap_account_to_safe(acct: dict[str, Any]) -> ImapAccountSafe:
+    acct_id = str(acct.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+    password_env = acct.get("password_env") or password_env_for_account_id(acct_id)
+    paths = acct.get("gmail_token_paths") or []
+    if not isinstance(paths, list):
+        paths = []
+    return ImapAccountSafe(
+        id=acct_id,
+        host=acct.get("host", ""),
+        port=int(acct.get("port", 993)),
+        username=acct.get("username", ""),
+        mailbox=acct.get("mailbox", "INBOX"),
+        use_ssl=bool(acct.get("use_ssl", True)),
+        delete_after_import=bool(acct.get("delete_after_import", True)),
+        since_date=acct.get("since_date"),
+        use_idle=bool(acct.get("use_idle", True)),
+        idle_refresh_minutes=max(1, int(acct.get("idle_refresh_minutes", 25))),
+        never_mark_spam=bool(acct.get("never_mark_spam", True)),
+        password_env=str(password_env),
+        password_set=_imap_account_password_set(acct),
+        gmail_token_paths=[str(p) for p in paths if str(p).strip()],
+    )
 
 
 def _verify_imap_credentials(
@@ -474,16 +655,31 @@ def api_gmail_email(request: Request) -> dict[str, str | None]:
 
 def _default_config_response() -> ConfigResponse:
     """Return empty config when config.json does not exist yet (avoids 404, show setup wizard)."""
+    empty_imap = ImapConfigSafe(
+        host="",
+        port=993,
+        username="",
+        mailbox="INBOX",
+        use_ssl=True,
+        delete_after_import=True,
+        since_date=None,
+    )
     return ConfigResponse(
-        imap=ImapConfigSafe(
-            host="",
-            port=993,
-            username="",
-            mailbox="INBOX",
-            use_ssl=True,
-            delete_after_import=True,
-            since_date=None,
-        ),
+        imap=empty_imap,
+        imap_accounts=[
+            ImapAccountSafe(
+                id=DEFAULT_IMAP_ACCOUNT_ID,
+                host="",
+                port=993,
+                username="",
+                mailbox="INBOX",
+                use_ssl=True,
+                delete_after_import=True,
+                password_env="IMAP_PASSWORD",
+                password_set=False,
+                gmail_token_paths=[],
+            )
+        ],
         gmail=GmailConfigSafe(
             use_label=False,
             label="ISP Mail",
@@ -521,7 +717,12 @@ def api_config(request: Request) -> ConfigResponse:
         cfg = load_config(path, resolve_password=False)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    imap = cfg.get("imap") or {}
+    try:
+        imap_accounts_raw = get_imap_accounts(cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    imap_accounts_safe = [_imap_account_to_safe(a) for a in imap_accounts_raw]
+    first = imap_accounts_safe[0] if imap_accounts_safe else None
     gmail_accounts = get_gmail_accounts(cfg)
     gmail = gmail_accounts[0] if gmail_accounts else {}
     ui = cfg.get("ui") or {}
@@ -540,17 +741,18 @@ def api_config(request: Request) -> ConfigResponse:
         )
     return ConfigResponse(
         imap=ImapConfigSafe(
-            host=imap.get("host", ""),
-            port=int(imap.get("port", 993)),
-            username=imap.get("username", ""),
-            mailbox=imap.get("mailbox", "INBOX"),
-            use_ssl=imap.get("use_ssl", True),
-            delete_after_import=imap.get("delete_after_import", True),
-            since_date=imap.get("since_date"),
-            use_idle=bool(imap.get("use_idle", True)),
-            idle_refresh_minutes=max(1, int(imap.get("idle_refresh_minutes", 25))),
-            never_mark_spam=bool(imap.get("never_mark_spam", True)),
+            host=first.host if first else "",
+            port=first.port if first else 993,
+            username=first.username if first else "",
+            mailbox=first.mailbox if first else "INBOX",
+            use_ssl=first.use_ssl if first else True,
+            delete_after_import=first.delete_after_import if first else True,
+            since_date=first.since_date if first else None,
+            use_idle=first.use_idle if first else True,
+            idle_refresh_minutes=first.idle_refresh_minutes if first else 25,
+            never_mark_spam=first.never_mark_spam if first else True,
         ),
+        imap_accounts=imap_accounts_safe,
         gmail=GmailConfigSafe(
             use_label=gmail.get("use_label") if "use_label" in gmail else bool((gmail.get("label") or "").strip()),
             label=gmail.get("label", "ISP Mail"),
@@ -572,7 +774,26 @@ def api_config(request: Request) -> ConfigResponse:
     )
 
 
+class ImapAccountUpdate(BaseModel):
+    id: str
+    host: str
+    port: int = 993
+    username: str
+    mailbox: str = "INBOX"
+    use_ssl: bool = True
+    delete_after_import: bool = True
+    since_date: str | None = None
+    use_idle: bool = True
+    idle_refresh_minutes: int = 25
+    never_mark_spam: bool = True
+    password: str | None = None  # stored in .env when provided
+    gmail_token_paths: list[str] = []
+
+
 class ConfigUpdate(BaseModel):
+    # Preferred: full IMAP accounts list
+    imap_accounts: list[ImapAccountUpdate] | None = None
+    # Legacy single-IMAP fields (applied to first account when imap_accounts omitted)
     imap_host: str | None = None
     imap_port: int | None = None
     imap_username: str | None = None
@@ -599,6 +820,7 @@ class SetupBody(BaseModel):
     imap_password: str
     imap_mailbox: str = "INBOX"
     imap_use_ssl: bool = True
+    imap_since_date: str | None = None
     delete_after_import: bool = True
     gmail_use_label: bool = False
     gmail_label: str = "ISP Mail"
@@ -618,7 +840,7 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
     if body.imap_since_date:
         try:
             datetime.date.fromisoformat(body.imap_since_date)
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=400, detail="since_date must be YYYY-MM-DD")
     try:
         _verify_imap_credentials(
@@ -633,20 +855,23 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=str(e))
     path.parent.mkdir(parents=True, exist_ok=True)
     cfg = {
-        "imap": {
-            "host": body.imap_host,
-            "port": body.imap_port,
-            "username": body.imap_username,
-            "password_env": "IMAP_PASSWORD",
-            "mailbox": body.imap_mailbox,
-            "since_date": body.imap_since_date,
-            "use_ssl": body.imap_use_ssl,
-            "delete_after_import": body.delete_after_import,
-            "never_mark_spam": True,
-            "use_idle": True,
-            "idle_refresh_minutes": 25,
-        },
-        # Canonical: gmail_accounts. Keep legacy readers working via get_gmail_accounts().
+        "imap_accounts": [
+            {
+                "id": DEFAULT_IMAP_ACCOUNT_ID,
+                "host": body.imap_host,
+                "port": body.imap_port,
+                "username": body.imap_username,
+                "password_env": "IMAP_PASSWORD",
+                "mailbox": body.imap_mailbox,
+                "since_date": body.imap_since_date,
+                "use_ssl": body.imap_use_ssl,
+                "delete_after_import": body.delete_after_import,
+                "never_mark_spam": True,
+                "use_idle": True,
+                "idle_refresh_minutes": 25,
+                "gmail_token_paths": [],
+            }
+        ],
         "gmail_accounts": [
             {
                 "use_label": body.gmail_use_label,
@@ -661,16 +886,27 @@ def api_setup(request: Request, body: SetupBody) -> dict[str, str]:
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    # set_encrypted_env also refreshes IMAP_PASSWORD_ENC in os.environ for watchers.
     set_encrypted_env(_config_dir(), "IMAP_PASSWORD", body.imap_password)
-    # Reload env so next request sees it
-    from dotenv import load_dotenv
-    load_dotenv(_config_dir() / ".env")
+    _sync_watcher_threads()
     return {"status": "ok", "message": "Config created. Connect Gmail next."}
+
+
+def _validate_imap_accounts_routing(
+    imap_accounts: list[dict[str, Any]], gmail_accounts: list[dict[str, Any]]
+) -> None:
+    """Raise HTTPException if any IMAP gmail_token_paths are invalid."""
+    cfg = {"gmail_accounts": gmail_accounts, "imap_accounts": imap_accounts}
+    for acct in imap_accounts:
+        try:
+            get_gmail_destinations_for_imap(cfg, acct)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.put("/api/config")
 def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
-    """Update config file. If imap_password provided, verify IMAP login then store in .env."""
+    """Update config file. IMAP passwords (when provided) are verified then stored in .env."""
     if not _require_auth(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     path = _get_config_path()
@@ -678,62 +914,9 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="config.json not found")
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
-    imap = cfg.setdefault("imap", {})
-    if update.imap_password is not None:
-        host = update.imap_host if update.imap_host is not None else imap.get("host", "")
-        port = int(update.imap_port if update.imap_port is not None else imap.get("port", 993))
-        username = update.imap_username if update.imap_username is not None else imap.get("username", "")
-        mailbox = update.imap_mailbox if update.imap_mailbox is not None else imap.get("mailbox", "INBOX")
-        use_ssl = update.imap_use_ssl if update.imap_use_ssl is not None else imap.get("use_ssl", True)
-        try:
-            _verify_imap_credentials(
-                host=host,
-                port=port,
-                username=username,
-                password=update.imap_password,
-                mailbox=mailbox,
-                use_ssl=use_ssl,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        imap["password_env"] = "IMAP_PASSWORD"
-        set_encrypted_env(_config_dir(), "IMAP_PASSWORD", update.imap_password)
-        from dotenv import load_dotenv
-        load_dotenv(_config_dir() / ".env")
-    if update.imap_host is not None:
-        imap["host"] = update.imap_host
-    if update.imap_port is not None:
-        imap["port"] = update.imap_port
-    if update.imap_username is not None:
-        imap["username"] = update.imap_username
-    if update.imap_mailbox is not None:
-        imap["mailbox"] = update.imap_mailbox
-    # UI always sends imap_since_date (string or null). null/"" clears the filter.
-    if "imap_since_date" in update.model_fields_set:
-        if update.imap_since_date:
-            try:
-                datetime.date.fromisoformat(update.imap_since_date)
-            except Exception:
-                raise HTTPException(status_code=400, detail="since_date must be YYYY-MM-DD")
-            cfg.setdefault("imap", {})["since_date"] = update.imap_since_date
-        else:
-            cfg.setdefault("imap", {})["since_date"] = None
 
-    if update.imap_use_ssl is not None:
-        imap["use_ssl"] = update.imap_use_ssl
-    if update.delete_after_import is not None:
-        cfg.setdefault("imap", {})["delete_after_import"] = update.delete_after_import
-    if update.never_mark_spam is not None:
-        cfg.setdefault("imap", {})["never_mark_spam"] = bool(update.never_mark_spam)
-    if update.imap_use_idle is not None:
-        cfg.setdefault("imap", {})["use_idle"] = bool(update.imap_use_idle)
-    if update.imap_idle_refresh_minutes is not None:
-        cfg.setdefault("imap", {})["idle_refresh_minutes"] = max(
-            1, int(update.imap_idle_refresh_minutes)
-        )
-    # Gmail accounts
+    # Gmail accounts first so routing validation can use the new list.
     if update.gmail_accounts is not None:
-        # Replace full list from UI (canonical).
         cfg["gmail_accounts"] = [
             {
                 "use_label": a.use_label,
@@ -743,11 +926,8 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
             }
             for a in update.gmail_accounts
         ]
-        # Do not keep legacy 'gmail' when explicitly using gmail_accounts.
-        if "gmail" in cfg:
-            cfg.pop("gmail", None)
+        cfg.pop("gmail", None)
     else:
-        # Back-compat: UI may still send gmail_use_label/gmail_label for the first account.
         if update.gmail_use_label is not None or update.gmail_label is not None:
             existing = get_gmail_accounts(cfg)
             if not existing:
@@ -760,14 +940,199 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
             rest = existing[1:]
             cfg["gmail_accounts"] = [first, *rest]
             cfg.pop("gmail", None)
+
+    gmail_accounts = get_gmail_accounts(cfg)
+    # Defer .env writes until the full update validates; commit with config.json.
+    pending_password_writes: list[tuple[str, str]] = []
+
+    if update.imap_accounts is not None:
+        if not update.imap_accounts:
+            raise HTTPException(status_code=400, detail="At least one IMAP account is required")
+        # Existing accounts by id — blank password means "keep current credentials".
+        existing_by_id: dict[str, dict[str, Any]] = {}
+        try:
+            for prev in get_imap_accounts(cfg):
+                existing_by_id[str(prev.get("id") or DEFAULT_IMAP_ACCOUNT_ID)] = prev
+        except ValueError:
+            existing_by_id = {}
+
+        # Validate ids + effective credential keys (incl. preserved custom password_env)
+        # for the whole list before any password writes.
+        seen_ids: set[str] = set()
+        submitted_ids: list[str] = []
+        for acct in update.imap_accounts:
+            acct_id = (acct.id or "").strip()
+            if not acct_id:
+                raise HTTPException(status_code=400, detail="IMAP account id cannot be empty")
+            if acct_id in seen_ids:
+                raise HTTPException(status_code=400, detail=f"Duplicate IMAP account id: {acct_id}")
+            seen_ids.add(acct_id)
+            submitted_ids.append(acct_id)
+        try:
+            validate_unique_password_env_keys(
+                submitted_ids, existing_by_id=existing_by_id
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        new_accounts: list[dict[str, Any]] = []
+        for acct in update.imap_accounts:
+            acct_id = (acct.id or "").strip()
+            if acct.since_date:
+                try:
+                    datetime.date.fromisoformat(acct.since_date)
+                except Exception:
+                    raise HTTPException(
+                        status_code=400, detail=f"since_date for {acct_id} must be YYYY-MM-DD"
+                    )
+            existing = existing_by_id.get(acct_id)
+            password_env = effective_password_env(acct_id, existing)
+            entry: dict[str, Any] = {
+                "id": acct_id,
+                "host": acct.host,
+                "port": int(acct.port),
+                "username": acct.username,
+                "password_env": password_env,
+                "mailbox": acct.mailbox or "INBOX",
+                "use_ssl": bool(acct.use_ssl),
+                "delete_after_import": bool(acct.delete_after_import),
+                "never_mark_spam": bool(acct.never_mark_spam),
+                "use_idle": bool(acct.use_idle),
+                "idle_refresh_minutes": max(1, int(acct.idle_refresh_minutes)),
+                "since_date": acct.since_date or None,
+                "gmail_token_paths": [p for p in (acct.gmail_token_paths or []) if str(p).strip()],
+            }
+            if acct.password:
+                try:
+                    _verify_imap_credentials(
+                        host=entry["host"],
+                        port=entry["port"],
+                        username=entry["username"],
+                        password=acct.password,
+                        mailbox=entry["mailbox"],
+                        use_ssl=entry["use_ssl"],
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=f"[{acct_id}] {e}") from e
+                # Queue write; flush only after the entire update validates.
+                pending_password_writes.append((password_env, acct.password))
+            elif existing:
+                # Leave blank → keep prior credential fields (inline password and/or env key).
+                if existing.get("password") not in (None, ""):
+                    entry["password"] = existing["password"]
+            new_accounts.append(entry)
+        _validate_imap_accounts_routing(new_accounts, gmail_accounts)
+        cfg["imap_accounts"] = new_accounts
+        cfg.pop("imap", None)
+    else:
+        # Legacy single-IMAP field updates → mutate first account / legacy imap.
+        try:
+            accounts = get_imap_accounts(cfg)
+        except ValueError:
+            accounts = []
+        if not accounts:
+            accounts = [
+                {
+                    "id": DEFAULT_IMAP_ACCOUNT_ID,
+                    "password_env": "IMAP_PASSWORD",
+                    "mailbox": "INBOX",
+                    "use_ssl": True,
+                    "delete_after_import": True,
+                    "never_mark_spam": True,
+                    "use_idle": True,
+                    "idle_refresh_minutes": 25,
+                    "gmail_token_paths": [],
+                }
+            ]
+        first = dict(accounts[0])
+        first.setdefault("id", DEFAULT_IMAP_ACCOUNT_ID)
+        if update.imap_password is not None:
+            host = update.imap_host if update.imap_host is not None else first.get("host", "")
+            port = int(update.imap_port if update.imap_port is not None else first.get("port", 993))
+            username = (
+                update.imap_username
+                if update.imap_username is not None
+                else first.get("username", "")
+            )
+            mailbox = (
+                update.imap_mailbox
+                if update.imap_mailbox is not None
+                else first.get("mailbox", "INBOX")
+            )
+            use_ssl = (
+                update.imap_use_ssl
+                if update.imap_use_ssl is not None
+                else first.get("use_ssl", True)
+            )
+            try:
+                _verify_imap_credentials(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=update.imap_password,
+                    mailbox=mailbox,
+                    use_ssl=use_ssl,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            password_env = first.get("password_env") or "IMAP_PASSWORD"
+            first["password_env"] = password_env
+            pending_password_writes.append((password_env, update.imap_password))
+        if update.imap_host is not None:
+            first["host"] = update.imap_host
+        if update.imap_port is not None:
+            first["port"] = update.imap_port
+        if update.imap_username is not None:
+            first["username"] = update.imap_username
+        if update.imap_mailbox is not None:
+            first["mailbox"] = update.imap_mailbox
+        if "imap_since_date" in update.model_fields_set:
+            if update.imap_since_date:
+                try:
+                    datetime.date.fromisoformat(update.imap_since_date)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="since_date must be YYYY-MM-DD")
+                first["since_date"] = update.imap_since_date
+            else:
+                first["since_date"] = None
+        if update.imap_use_ssl is not None:
+            first["use_ssl"] = update.imap_use_ssl
+        if update.delete_after_import is not None:
+            first["delete_after_import"] = update.delete_after_import
+        if update.never_mark_spam is not None:
+            first["never_mark_spam"] = bool(update.never_mark_spam)
+        if update.imap_use_idle is not None:
+            first["use_idle"] = bool(update.imap_use_idle)
+        if update.imap_idle_refresh_minutes is not None:
+            first["idle_refresh_minutes"] = max(1, int(update.imap_idle_refresh_minutes))
+        accounts[0] = first
+        cfg["imap_accounts"] = accounts
+        cfg.pop("imap", None)
+
+    # Strip removed Gmail token paths from IMAP routing lists (full-path identity).
+    # Reject if that would empty an explicit route (empty means "all destinations").
+    valid_tokens = {
+        str(a.get("token_path", "token.json")).strip() for a in get_gmail_accounts(cfg)
+    }
+    try:
+        prune_stale_gmail_routes(cfg.get("imap_accounts") or [], valid_tokens)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
     if update.poll_interval_minutes is not None:
         cfg["poll_interval_minutes"] = update.poll_interval_minutes
     if update.state_db_path is not None:
         cfg.setdefault("state", {})["db_path"] = update.state_db_path
+
+    # All validation passed — commit credentials and config together.
+    # set_encrypted_env refreshes only these keys in os.environ (load_dotenv would
+    # not override existing *_ENC values, so watchers would keep the old password).
+    for password_env, password in pending_password_writes:
+        set_encrypted_env(_config_dir(), password_env, password)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    _sync_watcher_threads()
     return {"status": "ok"}
-
 
 class DiscoveredToken(BaseModel):
     token_path: str
@@ -833,15 +1198,54 @@ def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> 
     if body.index >= len(accounts):
         raise HTTPException(status_code=400, detail="Invalid account index")
     token_path = str(accounts[body.index].get("token_path", "")).strip()
+    token_name = Path(token_path).name
     # Remove from config
     new_accounts = [accounts[i] for i in range(len(accounts)) if i != body.index]
     cfg["gmail_accounts"] = new_accounts
     cfg.pop("gmail", None)
+    # Strip deleted token from IMAP routing lists — but refuse if that would turn
+    # an explicit sole-destination route into [] ("all remaining Gmail accounts").
+    try:
+        imap_accounts = get_imap_accounts(cfg)
+    except ValueError:
+        imap_accounts = []
+    valid_tokens = {
+        str(a.get("token_path", "token.json")).strip() for a in new_accounts
+    }
+    try:
+        prune_stale_gmail_routes(imap_accounts, valid_tokens)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if imap_accounts:
+        cfg["imap_accounts"] = imap_accounts
+        cfg.pop("imap", None)
+
+    # Drop delivery history for this Gmail identity before the token file is gone,
+    # so a reused filename cannot inherit the previous account's skip records.
+    cfg_dir = _config_dir()
+    removed_acct = accounts[body.index]
+    try:
+        state_cfg = cfg.get("state") or {}
+        raw_db = state_cfg.get("db_path", "state.db")
+        db_path = Path(raw_db)
+        if not db_path.is_absolute():
+            db_path = cfg_dir / db_path
+        invalidate_keys = destination_keys_for_token_invalidation(
+            token_path,
+            cfg_dir,
+            credentials_path=removed_acct.get("credentials_path", "credentials.json"),
+        )
+        store = StateStore(str(db_path))
+        store.connect()
+        store.clear_hash_deliveries_for_destinations(invalidate_keys)
+        store.close()
+    except Exception:
+        logger.exception("Failed to clear hash delivery history for removed Gmail account")
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     try:
         # Delete token file (only if inside config dir and named token*.json)
-        cfg_dir = _config_dir()
         tp = Path(token_path)
         if not tp.is_absolute():
             tp = cfg_dir / tp
@@ -860,18 +1264,56 @@ def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> 
 class CopyAllBody(BaseModel):
     """Body for copy-all: copy every message from ISP to Gmail (with optional delete after)."""
     delete_after: bool = False
+    account_id: str | None = None  # omit = all accounts
 
 
 @app.post("/api/fetch")
-def api_fetch(request: Request, dry_run: bool = False) -> dict[str, Any]:
-    """Trigger one fetch cycle. Optionally dry_run."""
+def api_fetch(
+    request: Request,
+    dry_run: bool = False,
+    account_id: str | None = None,
+) -> dict[str, Any]:
+    """Trigger one fetch cycle (one account or all). Optionally dry_run."""
     if not _require_auth(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     setup_logging()
     install_log_buffer()
     try:
-        result = _run_once_locked(config_path=str(_get_config_path()), dry_run=dry_run)
-        return result
+        path = str(_get_config_path())
+        if account_id:
+            return _run_once_locked(
+                config_path=path, dry_run=dry_run, account_id=account_id
+            )
+        # All accounts (each under its own fetch lock / IDLE pause)
+        cfg = load_config(path, resolve_password=False)
+        accounts = get_imap_accounts(cfg)
+        if not accounts:
+            raise HTTPException(status_code=400, detail="No IMAP accounts configured")
+        totals = {"imported": 0, "skipped_duplicate": 0, "deleted": 0}
+        per: list[dict[str, Any]] = []
+        errors: list[str] = []
+        last_fetch_time: str | None = None
+        for acct in accounts:
+            aid = str(acct.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+            result = _run_once_locked(
+                config_path=path, dry_run=dry_run, account_id=aid
+            )
+            per.append(result)
+            totals["imported"] += int(result.get("imported") or 0)
+            totals["skipped_duplicate"] += int(result.get("skipped_duplicate") or 0)
+            totals["deleted"] += int(result.get("deleted") or 0)
+            if result.get("last_fetch_time"):
+                last_fetch_time = str(result["last_fetch_time"])
+            if result.get("error"):
+                errors.append(f"{aid}: {result['error']}")
+        return {
+            "error": "; ".join(errors) if errors else None,
+            "imported": totals["imported"],
+            "skipped_duplicate": totals["skipped_duplicate"],
+            "deleted": totals["deleted"],
+            "last_fetch_time": last_fetch_time,
+            "accounts": per,
+        }
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -880,20 +1322,48 @@ def api_fetch(request: Request, dry_run: bool = False) -> dict[str, Any]:
 
 @app.post("/api/fetch/copy-all")
 def api_fetch_copy_all(request: Request, body: CopyAllBody) -> dict[str, Any]:
-    """Copy all emails from ISP mailbox to Gmail (not just new). Skips already in Gmail. Optionally delete from ISP after."""
+    """Copy all emails from ISP mailbox(es) to Gmail. Optionally delete from ISP after."""
     if not _require_auth(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     setup_logging()
     install_log_buffer()
     try:
-        with _fetch_lock:
-            with pause_idle_connection():
-                result = run_copy_all(
-                    config_path=str(_get_config_path()),
-                    delete_after_import=body.delete_after,
-                    dry_run=False,
-                )
-        return result
+        path = str(_get_config_path())
+        cfg = load_config(path, resolve_password=False)
+        if body.account_id:
+            targets = [body.account_id]
+        else:
+            targets = [
+                str(a.get("id") or DEFAULT_IMAP_ACCOUNT_ID) for a in get_imap_accounts(cfg)
+            ]
+        if not targets:
+            raise HTTPException(status_code=400, detail="No IMAP accounts configured")
+        totals = {"imported": 0, "skipped_duplicate": 0, "deleted": 0, "error": None}
+        per: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for aid in targets:
+            with _fetch_lock_for(aid):
+                with pause_idle_connection(account_id=aid):
+                    result = run_copy_all(
+                        config_path=path,
+                        delete_after_import=body.delete_after,
+                        dry_run=False,
+                        account_id=aid,
+                    )
+            per.append(result)
+            totals["imported"] += int(result.get("imported") or 0)
+            totals["skipped_duplicate"] += int(result.get("skipped_duplicate") or 0)
+            totals["deleted"] += int(result.get("deleted") or 0)
+            if result.get("error"):
+                errors.append(f"{aid}: {result['error']}")
+        out = {
+            "error": "; ".join(errors) if errors else None,
+            "imported": totals["imported"],
+            "skipped_duplicate": totals["skipped_duplicate"],
+            "deleted": totals["deleted"],
+            "accounts": per,
+        }
+        return out
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -910,29 +1380,53 @@ def api_logs(request: Request, n: int = 100) -> dict[str, list[str]]:
 
 @app.get("/api/status")
 def api_status(request: Request) -> dict[str, Any]:
-    """Last fetch time and basic status."""
+    """Last fetch time(s) and basic status per IMAP account."""
     if not _require_auth(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         cfg = load_config(_get_config_path(), resolve_password=False)
-        from .state import StateStore
         state_cfg = cfg.get("state", {})
         raw_db_path = state_cfg.get("db_path", "state.db")
-        from pathlib import Path as _PathForStatus
-        db_path = _PathForStatus(raw_db_path)
+        db_path = Path(raw_db_path)
         if not db_path.is_absolute():
-            db_path = _PathForStatus(_get_config_path()).resolve().parent / db_path
-        mailbox = (cfg.get("imap") or {}).get("mailbox", "INBOX")
+            db_path = Path(_get_config_path()).resolve().parent / db_path
         state = StateStore(str(db_path))
         state.connect()
-        row = state.get_last_fetch_time_any(mailbox)
+        rows = state.get_all_last_fetch_times()
+        # Ensure every configured account appears
+        by_id = {str(r["account_id"]): r for r in rows}
+        accounts_out: list[dict[str, Any]] = []
+        try:
+            configured = get_imap_accounts(cfg)
+        except ValueError:
+            configured = []
+        for acct in configured:
+            aid = str(acct.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+            mailbox = acct.get("mailbox", "INBOX")
+            if aid in by_id:
+                accounts_out.append(by_id[aid])
+            else:
+                row = state.get_last_fetch_time_any(mailbox, account_id=aid)
+                accounts_out.append(
+                    {
+                        "account_id": aid,
+                        "mailbox": mailbox,
+                        "last_fetch_time": row[0] if row else None,
+                        "uid_validity": row[1] if row else None,
+                    }
+                )
         state.close()
-        if row:
-            return {"last_fetch_time": row[0], "uid_validity": row[1]}
-        return {"last_fetch_time": None, "uid_validity": None}
+        latest = None
+        for a in accounts_out:
+            t = a.get("last_fetch_time")
+            if t and (latest is None or str(t) > str(latest)):
+                latest = t
+        return {
+            "last_fetch_time": latest,
+            "accounts": accounts_out,
+        }
     except Exception:
-        return {"last_fetch_time": None, "error": "could not read state"}
-
+        return {"last_fetch_time": None, "accounts": [], "error": "could not read state"}
 
 _HTML_PAGE = """
 <!DOCTYPE html>
@@ -1065,27 +1559,15 @@ _HTML_PAGE = """
   </section>
 
   <section>
-    <h2>Config</h2>
-    <label>IMAP host <input id="imap_host" type="text"></label>
-    <label>IMAP port <input id="imap_port" type="number"></label>
-    <label style="display:inline-block; margin-top:0.25rem;"><input type="checkbox" id="imap_use_ssl"> Use SSL/TLS for IMAP</label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Uncheck for plain IMAP (e.g. port 143).</p>
-    <label>IMAP username <input id="imap_username" type="text"></label>
-    <label>IMAP password <input id="imap_password" type="password" placeholder="Leave blank to keep current (stored encrypted)"></label>
-    <label>Mailbox <input id="imap_mailbox" type="text" title="IMAP folder to fetch from. INBOX = main inbox."></label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Mailbox is the IMAP folder to fetch from. <strong>INBOX</strong> = main inbox where new mail arrives.</p>
-    <label>Only fetch mail on or after <input id="imap_since_date" type="date"></label>
-    <label style="margin-top:1rem;"><input type="checkbox" id="delete_after_import"> Delete emails from ISP after importing to Gmail</label>
-    <label><input type="checkbox" id="never_mark_spam"> Never mark imported mail as spam</label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Tells Gmail to ignore its spam classifier on API import (recommended for ISP→Gmail forwarding).</p>
-    <label><input type="checkbox" id="gmail_use_label"> Add a Gmail label to imported mail</label>
+    <h2>IMAP accounts</h2>
+    <p class="hint" style="font-size:0.85rem; color:#666;">One process can watch multiple IMAP mailboxes. Leave Gmail destinations unchecked to import into all configured Gmail accounts.</p>
+    <div id="imapAccounts"></div>
+    <button type="button" id="btnAddImapAccount" style="margin-top:0.75rem;">Add IMAP account</button>
+    <hr style="margin:1.25rem 0; border:none; border-top:1px solid #eee;">
+    <label><input type="checkbox" id="gmail_use_label"> Add a Gmail label to imported mail (primary account)</label>
     <div id="gmail_label_row" style="display:none;"><label>Label name <input id="gmail_label" type="text" placeholder="e.g. ISP Mail"></label></div>
-    <label style="margin-top:1rem;"><input type="checkbox" id="imap_use_idle"> Use IMAP IDLE (realtime) when the server supports it</label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">If the server does not advertise IDLE, the app falls back to the poll interval below.</p>
-    <label>IDLE refresh (minutes) <input id="idle_refresh" type="number" min="1" title="Re-enter IDLE with NOOP before the ~29 minute server timeout."></label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">RFC 2177: renew IDLE before ~29 minutes (default 25). Used only when IDLE is active.</p>
     <label>Poll interval (minutes) <input id="poll_interval" type="number" min="1"></label>
-    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Used when IDLE is unavailable or disabled.</p>
+    <p class="hint" style="font-size:0.85rem; color:#666; margin-top:0;">Used when IDLE is unavailable or disabled (shared across IMAP accounts).</p>
     <label>State DB path <input id="state_db" type="text"></label>
     <button type="button" id="btnSave">Save config</button>
   </section>
@@ -1125,11 +1607,138 @@ _APP_JS = r"""
   if (params.get('error') === 'no_credentials') document.getElementById('subtitle').innerHTML = '<span class="error">Put credentials.json in the app folder and run fetch2gmail auth for token.json.</span>';
 
   function hideLoading() { var el = document.getElementById('loadingMsg'); if (el) el.style.display = 'none'; }
+  var _imapAccountsState = [];
+  var _gmailAccountsForRouting = [];
   function ensureGmailAccounts(c) {
     if (c.gmail_accounts && c.gmail_accounts.length) return c.gmail_accounts;
     // Back-compat: synthesize from single c.gmail
     if (c.gmail) return [c.gmail];
     return [];
+  }
+  function ensureImapAccounts(c) {
+    if (c.imap_accounts && c.imap_accounts.length) return JSON.parse(JSON.stringify(c.imap_accounts));
+    if (c.imap) {
+      return [{
+        id: 'default',
+        host: c.imap.host || '',
+        port: c.imap.port || 993,
+        username: c.imap.username || '',
+        mailbox: c.imap.mailbox || 'INBOX',
+        use_ssl: c.imap.use_ssl !== false,
+        delete_after_import: c.imap.delete_after_import !== false,
+        since_date: c.imap.since_date || null,
+        use_idle: c.imap.use_idle !== false,
+        idle_refresh_minutes: c.imap.idle_refresh_minutes || 25,
+        never_mark_spam: c.imap.never_mark_spam !== false,
+        password_set: !!c.imap_password_set,
+        gmail_token_paths: []
+      }];
+    }
+    return [];
+  }
+  function esc(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function collectImapAccountsFromDom() {
+    var wrap = document.getElementById('imapAccounts');
+    if (!wrap) return _imapAccountsState.slice();
+    var cards = wrap.querySelectorAll('[data-imap-idx]');
+    var out = [];
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      var idx = parseInt(card.getAttribute('data-imap-idx'), 10);
+      var prev = _imapAccountsState[idx] || {};
+      var idEl = card.querySelector('[data-f="id"]');
+      var hostEl = card.querySelector('[data-f="host"]');
+      var portEl = card.querySelector('[data-f="port"]');
+      var userEl = card.querySelector('[data-f="username"]');
+      var mailboxEl = card.querySelector('[data-f="mailbox"]');
+      var sinceEl = card.querySelector('[data-f="since_date"]');
+      var pwEl = card.querySelector('[data-f="password"]');
+      var idleRefreshEl = card.querySelector('[data-f="idle_refresh_minutes"]');
+      var paths = [];
+      var checks = card.querySelectorAll('[data-gmail-token]');
+      for (var c = 0; c < checks.length; c++) {
+        if (checks[c].checked) paths.push(checks[c].getAttribute('data-gmail-token'));
+      }
+      out.push({
+        id: (idEl && idEl.value || '').trim(),
+        host: hostEl ? hostEl.value : '',
+        port: portEl ? parseInt(portEl.value, 10) || 993 : 993,
+        username: userEl ? userEl.value : '',
+        mailbox: mailboxEl ? mailboxEl.value : 'INBOX',
+        use_ssl: !!(card.querySelector('[data-f="use_ssl"]') || {}).checked,
+        delete_after_import: !!(card.querySelector('[data-f="delete_after_import"]') || {}).checked,
+        never_mark_spam: !!(card.querySelector('[data-f="never_mark_spam"]') || {}).checked,
+        use_idle: !!(card.querySelector('[data-f="use_idle"]') || {}).checked,
+        idle_refresh_minutes: idleRefreshEl ? (parseInt(idleRefreshEl.value, 10) || 25) : 25,
+        since_date: sinceEl && sinceEl.value ? sinceEl.value : null,
+        password: pwEl && pwEl.value ? pwEl.value : null,
+        password_set: !!prev.password_set,
+        gmail_token_paths: paths
+      });
+    }
+    return out;
+  }
+  function renderImapAccounts(c) {
+    var wrap = document.getElementById('imapAccounts');
+    if (!wrap) return;
+    _imapAccountsState = ensureImapAccounts(c);
+    _gmailAccountsForRouting = ensureGmailAccounts(c);
+    if (!_imapAccountsState.length) {
+      wrap.innerHTML = '<p class="error">No IMAP accounts. Click Add IMAP account.</p>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < _imapAccountsState.length; i++) {
+      var a = _imapAccountsState[i];
+      var selected = {};
+      var paths = a.gmail_token_paths || [];
+      var allSelected = !paths.length;
+      for (var p = 0; p < paths.length; p++) selected[paths[p]] = true;
+      html += '<div data-imap-idx="' + i + '" style="border:1px solid #e5e5e5; padding:0.75rem; margin:0.75rem 0; border-radius:4px;">';
+      html += '<div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">';
+      html += '<strong>IMAP #' + (i + 1) + '</strong>';
+      html += ( _imapAccountsState.length > 1 ? '<button type="button" data-idel="' + i + '">Remove</button>' : '' );
+      html += '</div>';
+      html += '<label>Id <input data-f="id" type="text" value="' + esc(a.id || '') + '" placeholder="e.g. isp1"></label>';
+      html += '<label>Host <input data-f="host" type="text" value="' + esc(a.host || '') + '"></label>';
+      html += '<label>Port <input data-f="port" type="number" value="' + esc(a.port || 993) + '"></label>';
+      html += '<label style="display:inline-block; margin-top:0.25rem;"><input type="checkbox" data-f="use_ssl"' + (a.use_ssl !== false ? ' checked' : '') + '> Use SSL/TLS</label>';
+      html += '<label>Username <input data-f="username" type="text" value="' + esc(a.username || '') + '"></label>';
+      // Restore a.password when re-rendering after Add/Remove so typed credentials are not cleared.
+      html += '<label>Password <input data-f="password" type="password" value="' + esc(a.password || '') + '" placeholder="' + (a.password_set ? 'Leave blank to keep current' : 'Required') + '" autocomplete="off"></label>';
+      html += '<label>Mailbox <input data-f="mailbox" type="text" value="' + esc(a.mailbox || 'INBOX') + '"></label>';
+      html += '<label>Only fetch on or after <input data-f="since_date" type="date" value="' + esc(a.since_date || '') + '"></label>';
+      html += '<label style="margin-top:0.5rem;"><input type="checkbox" data-f="delete_after_import"' + (a.delete_after_import !== false ? ' checked' : '') + '> Delete from ISP after import</label>';
+      html += '<label><input type="checkbox" data-f="never_mark_spam"' + (a.never_mark_spam !== false ? ' checked' : '') + '> Never mark imported mail as spam</label>';
+      html += '<label><input type="checkbox" data-f="use_idle"' + (a.use_idle !== false ? ' checked' : '') + '> Use IMAP IDLE when supported</label>';
+      html += '<label>IDLE refresh (minutes) <input data-f="idle_refresh_minutes" type="number" min="1" value="' + esc(a.idle_refresh_minutes || 25) + '"></label>';
+      html += '<div style="margin-top:0.75rem;"><strong>Gmail destinations</strong>';
+      html += '<p class="hint" style="font-size:0.85rem; color:#666; margin:0.25rem 0;">Unchecked = all Gmail accounts. Check specific tokens to route this IMAP account.</p>';
+      if (!_gmailAccountsForRouting.length) {
+        html += '<p class="error">No Gmail accounts configured.</p>';
+      } else {
+        for (var g = 0; g < _gmailAccountsForRouting.length; g++) {
+          var ga = _gmailAccountsForRouting[g];
+          var tp = ga.token_path || 'token.json';
+          var checked = allSelected || !!selected[tp];
+          html += '<label style="display:block;"><input type="checkbox" data-gmail-token="' + esc(tp) + '"' + (checked && !allSelected ? ' checked' : '') + '> ' + esc(ga.label || tp) + ' (<code>' + esc(tp) + '</code>)</label>';
+        }
+      }
+      html += '</div></div>';
+    }
+    wrap.innerHTML = html;
+    var delBtns = wrap.querySelectorAll('button[data-idel]');
+    for (var d = 0; d < delBtns.length; d++) {
+      delBtns[d].onclick = function(ev) {
+        var idx = parseInt(ev.target.getAttribute('data-idel'), 10);
+        _imapAccountsState = collectImapAccountsFromDom();
+        if (_imapAccountsState.length <= 1) return;
+        _imapAccountsState.splice(idx, 1);
+        renderImapAccounts({ imap_accounts: _imapAccountsState, gmail_accounts: _gmailAccountsForRouting });
+      };
+    }
   }
   function renderGmailAccounts(c) {
     var wrap = document.getElementById('gmailAccounts');
@@ -1239,16 +1848,6 @@ _APP_JS = r"""
       document.getElementById('setPasswordWizard').style.display = 'none';
       document.getElementById('setupWizard').style.display = 'none';
       document.getElementById('dashboard').style.display = 'block';
-      document.getElementById('imap_host').value = c.imap.host;
-      document.getElementById('imap_port').value = c.imap.port;
-      document.getElementById('imap_use_ssl').checked = c.imap.use_ssl;
-      document.getElementById('imap_username').value = c.imap.username;
-      document.getElementById('imap_mailbox').value = c.imap.mailbox;
-      document.getElementById('imap_since_date').value = c.imap.since_date || '';
-      document.getElementById('delete_after_import').checked = c.imap.delete_after_import;
-      document.getElementById('never_mark_spam').checked = c.imap.never_mark_spam !== false;
-      document.getElementById('imap_use_idle').checked = c.imap.use_idle !== false;
-      document.getElementById('idle_refresh').value = c.imap.idle_refresh_minutes || 25;
       document.getElementById('gmail_use_label').checked = c.gmail.use_label;
       document.getElementById('gmail_label_row').style.display = c.gmail.use_label ? 'block' : 'none';
       document.getElementById('gmail_label').value = c.gmail.label;
@@ -1285,6 +1884,7 @@ _APP_JS = r"""
           document.getElementById('gmailEmail').textContent = 'Connected as ' + uniq.join(', ');
         }).catch(function() {});
       }
+      renderImapAccounts(c);
       renderGmailAccounts(c);
       return c;
     }).catch(function(e) {
@@ -1299,7 +1899,14 @@ _APP_JS = r"""
   }
   function loadStatus() {
     return api('/api/status').then(function(s) {
-      document.getElementById('status').textContent = 'Last fetch: ' + (s.last_fetch_time || 'never');
+      var parts = ['Last fetch: ' + (s.last_fetch_time || 'never')];
+      if (s.accounts && s.accounts.length > 1) {
+        for (var i = 0; i < s.accounts.length; i++) {
+          var a = s.accounts[i];
+          parts.push('[' + (a.account_id || '?') + '] ' + (a.last_fetch_time || 'never'));
+        }
+      }
+      document.getElementById('status').textContent = parts.join(' | ');
       document.getElementById('status').className = 'status';
     }).catch(function(e) {
       document.getElementById('status').textContent = 'Status: ' + ((e.detail && e.detail.detail) ? e.detail.detail : e.message);
@@ -1434,54 +2041,85 @@ _APP_JS = r"""
     document.getElementById('gmail_label_row').style.display = this.checked ? 'block' : 'none';
   };
   document.getElementById('btnSave').onclick = function() {
-    // Read current accounts from UI (labels only editable here).
-    var currentAccounts = null;
-    try {
-      // use last loaded config from DOM if present
-      // We'll rebuild from /api/config right before save to avoid stale token list
-    } catch (e) {}
+    var imapAccounts = collectImapAccountsFromDom();
+    if (!imapAccounts.length) {
+      document.getElementById('status').textContent = 'Error: at least one IMAP account is required';
+      document.getElementById('status').className = 'error';
+      return;
+    }
+    for (var i = 0; i < imapAccounts.length; i++) {
+      if (!imapAccounts[i].id) {
+        document.getElementById('status').textContent = 'Error: each IMAP account needs an id';
+        document.getElementById('status').className = 'error';
+        return;
+      }
+    }
     var body = {
-      imap_host: document.getElementById('imap_host').value,
-      imap_port: parseInt(document.getElementById('imap_port').value, 10),
-      imap_use_ssl: document.getElementById('imap_use_ssl').checked,
-      imap_username: document.getElementById('imap_username').value,
-      imap_mailbox: document.getElementById('imap_mailbox').value,
-      imap_since_date: document.getElementById('imap_since_date').value || null,
-      delete_after_import: document.getElementById('delete_after_import').checked,
-      never_mark_spam: document.getElementById('never_mark_spam').checked,
-      imap_use_idle: document.getElementById('imap_use_idle').checked,
-      imap_idle_refresh_minutes: parseInt(document.getElementById('idle_refresh').value, 10),
+      imap_accounts: imapAccounts.map(function(a) {
+        var entry = {
+          id: a.id,
+          host: a.host,
+          port: a.port,
+          username: a.username,
+          mailbox: a.mailbox,
+          use_ssl: a.use_ssl,
+          delete_after_import: a.delete_after_import,
+          never_mark_spam: a.never_mark_spam,
+          use_idle: a.use_idle,
+          idle_refresh_minutes: a.idle_refresh_minutes,
+          since_date: a.since_date,
+          gmail_token_paths: a.gmail_token_paths || []
+        };
+        if (a.password) entry.password = a.password;
+        return entry;
+      }),
       gmail_use_label: document.getElementById('gmail_use_label').checked,
       gmail_label: document.getElementById('gmail_label').value,
       poll_interval_minutes: parseInt(document.getElementById('poll_interval').value, 10),
       state_db_path: document.getElementById('state_db').value
     };
-    var pw = document.getElementById('imap_password').value;
-    if (pw) body.imap_password = pw;
-    // Merge updated settings into gmail_accounts and save canonical list.
     api('/api/config').then(function(c) {
       var accounts = ensureGmailAccounts(c);
       var useLabel = document.getElementById('gmail_use_label').checked;
       var globalLabel = document.getElementById('gmail_label').value || 'ISP Mail';
-      // Apply global label toggle to all accounts; apply global label NAME only to primary
-      // account so per-account labels (e.g. email-based) are not overwritten.
       for (var k = 0; k < accounts.length; k++) {
         accounts[k].use_label = useLabel;
-        if (k === 0) {
-          accounts[k].label = globalLabel;
-        }
+        if (k === 0) accounts[k].label = globalLabel;
       }
       body.gmail_accounts = accounts;
       return put('/api/config', body);
     }).then(function() {
       document.getElementById('status').textContent = 'Config saved.';
       document.getElementById('status').className = 'status';
-      if (pw) document.getElementById('imap_password').value = '';
+      return loadConfig();
     }).catch(function(e) {
       document.getElementById('status').textContent = 'Error: ' + (typeof e.detail === 'string' ? e.detail : (e.detail && e.detail.detail) || e.message || 'Save failed');
       document.getElementById('status').className = 'error';
     });
   };
+  var addImapBtn = document.getElementById('btnAddImapAccount');
+  if (addImapBtn) {
+    addImapBtn.onclick = function() {
+      _imapAccountsState = collectImapAccountsFromDom();
+      var n = _imapAccountsState.length + 1;
+      _imapAccountsState.push({
+        id: 'isp' + n,
+        host: '',
+        port: 993,
+        username: '',
+        mailbox: 'INBOX',
+        use_ssl: true,
+        delete_after_import: true,
+        never_mark_spam: true,
+        use_idle: true,
+        idle_refresh_minutes: 25,
+        since_date: null,
+        password_set: false,
+        gmail_token_paths: []
+      });
+      renderImapAccounts({ imap_accounts: _imapAccountsState, gmail_accounts: _gmailAccountsForRouting });
+    };
+  }
   document.getElementById('btnRefreshLogs').onclick = loadLogs;
 
   document.getElementById('s_gmail_use_label').onchange = function() {
