@@ -29,7 +29,9 @@ from .config import (
     get_gmail_destinations_for_imap,
     get_imap_accounts,
     load_config,
-    password_env_key_for_account_id,
+    password_env_for_account_id,
+    validate_unique_password_env_keys,
+    prune_stale_gmail_routes,
 )
 from .env_file import set_encrypted_env
 from .gmail_client import get_gmail_service
@@ -67,7 +69,12 @@ def _load_imap_settings_for_account(account_id: str) -> dict[str, Any] | None:
     if not _config_exists():
         return None
     path = _get_config_path()
-    cfg = load_config(path, resolve_password=True)
+    # Resolve only this account's password so a broken sibling cannot stop us.
+    try:
+        cfg = load_config(path, resolve_password=True, account_id=account_id)
+    except ValueError as e:
+        logger.warning("IMAP settings for %s skipped: %s", account_id, e)
+        return None
     try:
         accounts = get_imap_accounts(cfg)
     except ValueError:
@@ -566,11 +573,7 @@ def _imap_account_password_set(imap: dict[str, Any]) -> bool:
     if imap.get("password") not in (None, ""):
         return True
     acct_id = str(imap.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
-    key = imap.get("password_env") or (
-        "IMAP_PASSWORD"
-        if acct_id == DEFAULT_IMAP_ACCOUNT_ID
-        else password_env_key_for_account_id(acct_id)
-    )
+    key = imap.get("password_env") or password_env_for_account_id(acct_id)
     return bool(os.environ.get(key) or os.environ.get(f"{key}_ENC"))
 
 
@@ -590,11 +593,7 @@ def _imap_password_set() -> bool:
 
 def _imap_account_to_safe(acct: dict[str, Any]) -> ImapAccountSafe:
     acct_id = str(acct.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
-    password_env = acct.get("password_env") or (
-        "IMAP_PASSWORD"
-        if acct_id == DEFAULT_IMAP_ACCOUNT_ID
-        else password_env_key_for_account_id(acct_id)
-    )
+    password_env = acct.get("password_env") or password_env_for_account_id(acct_id)
     paths = acct.get("gmail_token_paths") or []
     if not isinstance(paths, list):
         paths = []
@@ -950,8 +949,9 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
     if update.imap_accounts is not None:
         if not update.imap_accounts:
             raise HTTPException(status_code=400, detail="At least one IMAP account is required")
+        # Validate ids + derived credential keys for the whole list before any password writes.
         seen_ids: set[str] = set()
-        new_accounts: list[dict[str, Any]] = []
+        submitted_ids: list[str] = []
         for acct in update.imap_accounts:
             acct_id = (acct.id or "").strip()
             if not acct_id:
@@ -959,6 +959,23 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
             if acct_id in seen_ids:
                 raise HTTPException(status_code=400, detail=f"Duplicate IMAP account id: {acct_id}")
             seen_ids.add(acct_id)
+            submitted_ids.append(acct_id)
+        try:
+            validate_unique_password_env_keys(submitted_ids)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # Existing accounts by id — blank password means "keep current credentials".
+        existing_by_id: dict[str, dict[str, Any]] = {}
+        try:
+            for prev in get_imap_accounts(cfg):
+                existing_by_id[str(prev.get("id") or DEFAULT_IMAP_ACCOUNT_ID)] = prev
+        except ValueError:
+            existing_by_id = {}
+
+        new_accounts: list[dict[str, Any]] = []
+        for acct in update.imap_accounts:
+            acct_id = (acct.id or "").strip()
             if acct.since_date:
                 try:
                     datetime.date.fromisoformat(acct.since_date)
@@ -966,11 +983,12 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
                     raise HTTPException(
                         status_code=400, detail=f"since_date for {acct_id} must be YYYY-MM-DD"
                     )
-            password_env = (
-                "IMAP_PASSWORD"
-                if acct_id == DEFAULT_IMAP_ACCOUNT_ID
-                else password_env_key_for_account_id(acct_id)
-            )
+            existing = existing_by_id.get(acct_id)
+            # Prefer an existing custom password_env (e.g. ISP_SECRET) over regenerating.
+            if existing and existing.get("password_env"):
+                password_env = str(existing["password_env"])
+            else:
+                password_env = password_env_for_account_id(acct_id)
             entry: dict[str, Any] = {
                 "id": acct_id,
                 "host": acct.host,
@@ -999,6 +1017,11 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=f"[{acct_id}] {e}") from e
                 set_encrypted_env(_config_dir(), password_env, acct.password)
+                # Password now lives in .env; do not keep a stale inline password.
+            elif existing:
+                # Leave blank → keep prior credential fields (inline password and/or env key).
+                if existing.get("password") not in (None, ""):
+                    entry["password"] = existing["password"]
             new_accounts.append(entry)
         _validate_imap_accounts_routing(new_accounts, gmail_accounts)
         cfg["imap_accounts"] = new_accounts
@@ -1091,15 +1114,14 @@ def api_config_update(request: Request, update: ConfigUpdate) -> dict[str, str]:
         cfg.pop("imap", None)
 
     # Strip removed Gmail token paths from IMAP routing lists.
+    # Reject if that would empty an explicit route (empty means "all destinations").
     valid_tokens = {
         Path(str(a.get("token_path", "token.json"))).name for a in get_gmail_accounts(cfg)
     }
-    for acct in cfg.get("imap_accounts") or []:
-        paths = acct.get("gmail_token_paths") or []
-        if isinstance(paths, list):
-            acct["gmail_token_paths"] = [
-                p for p in paths if Path(str(p)).name in valid_tokens or str(p) in valid_tokens
-            ]
+    try:
+        prune_stale_gmail_routes(cfg.get("imap_accounts") or [], valid_tokens)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     if update.poll_interval_minutes is not None:
         cfg["poll_interval_minutes"] = update.poll_interval_minutes
@@ -1179,19 +1201,19 @@ def api_delete_gmail_account(request: Request, body: DeleteGmailAccountBody) -> 
     new_accounts = [accounts[i] for i in range(len(accounts)) if i != body.index]
     cfg["gmail_accounts"] = new_accounts
     cfg.pop("gmail", None)
-    # Strip deleted token from IMAP routing lists
+    # Strip deleted token from IMAP routing lists — but refuse if that would turn
+    # an explicit sole-destination route into [] ("all remaining Gmail accounts").
     try:
         imap_accounts = get_imap_accounts(cfg)
     except ValueError:
         imap_accounts = []
-    for acct in imap_accounts:
-        paths = acct.get("gmail_token_paths") or []
-        if isinstance(paths, list):
-            acct["gmail_token_paths"] = [
-                p
-                for p in paths
-                if Path(str(p)).name != token_name and str(p) != token_path
-            ]
+    valid_tokens = {
+        Path(str(a.get("token_path", "token.json"))).name for a in new_accounts
+    }
+    try:
+        prune_stale_gmail_routes(imap_accounts, valid_tokens)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if imap_accounts:
         cfg["imap_accounts"] = imap_accounts
         cfg.pop("imap", None)
@@ -1660,7 +1682,8 @@ _APP_JS = r"""
       html += '<label>Port <input data-f="port" type="number" value="' + esc(a.port || 993) + '"></label>';
       html += '<label style="display:inline-block; margin-top:0.25rem;"><input type="checkbox" data-f="use_ssl"' + (a.use_ssl !== false ? ' checked' : '') + '> Use SSL/TLS</label>';
       html += '<label>Username <input data-f="username" type="text" value="' + esc(a.username || '') + '"></label>';
-      html += '<label>Password <input data-f="password" type="password" placeholder="' + (a.password_set ? 'Leave blank to keep current' : 'Required') + '"></label>';
+      // Restore a.password when re-rendering after Add/Remove so typed credentials are not cleared.
+      html += '<label>Password <input data-f="password" type="password" value="' + esc(a.password || '') + '" placeholder="' + (a.password_set ? 'Leave blank to keep current' : 'Required') + '" autocomplete="off"></label>';
       html += '<label>Mailbox <input data-f="mailbox" type="text" value="' + esc(a.mailbox || 'INBOX') + '"></label>';
       html += '<label>Only fetch on or after <input data-f="since_date" type="date" value="' + esc(a.since_date || '') + '"></label>';
       html += '<label style="margin-top:0.5rem;"><input type="checkbox" data-f="delete_after_import"' + (a.delete_after_import !== false ? ' checked' : '') + '> Delete from ISP after import</label>';

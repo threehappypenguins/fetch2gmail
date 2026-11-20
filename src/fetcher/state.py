@@ -12,12 +12,34 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ACCOUNT_ID = "default"
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix
+    fcntl = None  # type: ignore[assignment]
+
+
+@contextmanager
+def _schema_lock(db_path: Path) -> Iterator[None]:
+    """Exclusive lock for schema create/migrate (SQLite DDL cannot hold a write txn)."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = Path(str(db_path) + ".schema.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 class StateStore:
@@ -32,10 +54,14 @@ class StateStore:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._path), timeout=30)
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        self._create_tables()
-
+        # Serialize pragma + schema setup: concurrent connects can otherwise race on
+        # journal_mode/CREATE before either holds a schema lock.
+        with _schema_lock(self._path):
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA busy_timeout = 30000")
+            self._conn.commit()
+            self._create_tables()
     def _table_columns(self, table: str) -> set[str]:
         assert self._conn is not None
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -43,23 +69,29 @@ class StateStore:
 
     def _needs_account_id_migration(self) -> bool:
         assert self._conn is not None
-        tables = {
-            r[0]
+        tables = self._list_tables()
+        if "uid_state" not in tables:
+            return False
+        return "account_id" not in self._table_columns("uid_state")
+    def _list_tables(self) -> set[str]:
+        assert self._conn is not None
+        return {
+            str(r[0])
             for r in self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if "uid_state" not in tables:
-            return False
-        return "account_id" not in self._table_columns("uid_state")
 
     def _migrate_add_account_id(self) -> None:
-        """Rebuild tables to include account_id; existing rows become account_id='default'."""
+        """Rebuild tables to include account_id; existing rows become account_id='default'.
+
+        Caller must hold the schema file lock and recheck that migration is still
+        needed. Avoids executescript() (it auto-COMMITs before running).
+        """
         assert self._conn is not None
         logger.info("Migrating state.db to add account_id column (default=%r)", DEFAULT_ACCOUNT_ID)
-        self._conn.executescript(
-            f"""
-            BEGIN;
+        stmts = [
+            """
             CREATE TABLE uid_state_new (
                 account_id TEXT NOT NULL,
                 mailbox TEXT NOT NULL,
@@ -67,11 +99,14 @@ class StateStore:
                 last_processed_uid INTEGER NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 PRIMARY KEY (account_id, mailbox, uid_validity)
-            );
+            )
+            """,
+            f"""
             INSERT INTO uid_state_new (account_id, mailbox, uid_validity, last_processed_uid, updated_at)
             SELECT '{DEFAULT_ACCOUNT_ID}', mailbox, uid_validity, last_processed_uid, updated_at
-            FROM uid_state;
-
+            FROM uid_state
+            """,
+            """
             CREATE TABLE message_hashes_new (
                 account_id TEXT NOT NULL,
                 message_hash TEXT NOT NULL,
@@ -80,11 +115,14 @@ class StateStore:
                 mailbox TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 PRIMARY KEY (account_id, message_hash)
-            );
+            )
+            """,
+            f"""
             INSERT INTO message_hashes_new (account_id, message_hash, gmail_message_id, uid_validity, mailbox, created_at)
             SELECT '{DEFAULT_ACCOUNT_ID}', message_hash, gmail_message_id, uid_validity, mailbox, created_at
-            FROM message_hashes;
-
+            FROM message_hashes
+            """,
+            """
             CREATE TABLE uid_to_gmail_new (
                 account_id TEXT NOT NULL,
                 mailbox TEXT NOT NULL,
@@ -96,76 +134,112 @@ class StateStore:
                 PRIMARY KEY (account_id, mailbox, uid_validity, uid),
                 FOREIGN KEY (account_id, message_hash)
                     REFERENCES message_hashes_new(account_id, message_hash)
-            );
+            )
+            """,
+            f"""
             INSERT INTO uid_to_gmail_new (
                 account_id, mailbox, uid_validity, uid, gmail_message_id, message_hash, created_at
             )
             SELECT '{DEFAULT_ACCOUNT_ID}', mailbox, uid_validity, uid, gmail_message_id, message_hash, created_at
-            FROM uid_to_gmail;
+            FROM uid_to_gmail
+            """,
+            "DROP TABLE uid_to_gmail",
+            "DROP TABLE message_hashes",
+            "DROP TABLE uid_state",
+            "ALTER TABLE uid_state_new RENAME TO uid_state",
+            "ALTER TABLE message_hashes_new RENAME TO message_hashes",
+            "ALTER TABLE uid_to_gmail_new RENAME TO uid_to_gmail",
+            "CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash ON uid_to_gmail(message_hash)",
+        ]
+        for sql in stmts:
+            self._conn.execute(sql)
 
-            DROP TABLE uid_to_gmail;
-            DROP TABLE message_hashes;
-            DROP TABLE uid_state;
-            ALTER TABLE uid_state_new RENAME TO uid_state;
-            ALTER TABLE message_hashes_new RENAME TO message_hashes;
-            ALTER TABLE uid_to_gmail_new RENAME TO uid_to_gmail;
-            CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash ON uid_to_gmail(message_hash);
-            COMMIT;
+    def _create_fresh_schema(self) -> None:
+        """Create modern schema tables (IF NOT EXISTS for defense in depth)."""
+        assert self._conn is not None
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uid_state (
+                account_id TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                uid_validity INTEGER NOT NULL,
+                last_processed_uid INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                PRIMARY KEY (account_id, mailbox, uid_validity)
+            )
             """
         )
-
-    def _create_tables(self) -> None:
-        assert self._conn is not None
-        tables = {
-            r[0]
-            for r in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "uid_state" not in tables:
-            self._conn.executescript(
-                """
-                CREATE TABLE uid_state (
-                    account_id TEXT NOT NULL,
-                    mailbox TEXT NOT NULL,
-                    uid_validity INTEGER NOT NULL,
-                    last_processed_uid INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-                    PRIMARY KEY (account_id, mailbox, uid_validity)
-                );
-                CREATE TABLE message_hashes (
-                    account_id TEXT NOT NULL,
-                    message_hash TEXT NOT NULL,
-                    gmail_message_id TEXT,
-                    uid_validity INTEGER NOT NULL,
-                    mailbox TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-                    PRIMARY KEY (account_id, message_hash)
-                );
-                CREATE TABLE uid_to_gmail (
-                    account_id TEXT NOT NULL,
-                    mailbox TEXT NOT NULL,
-                    uid_validity INTEGER NOT NULL,
-                    uid INTEGER NOT NULL,
-                    gmail_message_id TEXT NOT NULL,
-                    message_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-                    PRIMARY KEY (account_id, mailbox, uid_validity, uid),
-                    FOREIGN KEY (account_id, message_hash)
-                        REFERENCES message_hashes(account_id, message_hash)
-                );
-                CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash ON uid_to_gmail(message_hash);
-                """
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_hashes (
+                account_id TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                gmail_message_id TEXT,
+                uid_validity INTEGER NOT NULL,
+                mailbox TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                PRIMARY KEY (account_id, message_hash)
             )
-            self._conn.commit()
-            return
-
-        if self._needs_account_id_migration():
-            self._migrate_add_account_id()
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uid_to_gmail (
+                account_id TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                uid_validity INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                gmail_message_id TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                PRIMARY KEY (account_id, mailbox, uid_validity, uid),
+                FOREIGN KEY (account_id, message_hash)
+                    REFERENCES message_hashes(account_id, message_hash)
+            )
+            """
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash ON uid_to_gmail(message_hash)"
         )
-        self._conn.commit()
+
+    def _create_tables(self) -> None:
+        """Inspect schema and create/migrate. Caller must hold `_schema_lock`.
+
+        Recheck after the lock is acquired so concurrent workers do not both create
+        or migrate. SQLite auto-commits before DDL, so BEGIN IMMEDIATE alone cannot
+        span CREATE TABLE — the file lock is the real serializer.
+        """
+        assert self._conn is not None
+        # DB write lock for the inspection window before any DDL auto-commit.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            tables = self._list_tables()
+            needs_fresh = "uid_state" not in tables
+            needs_migrate = (not needs_fresh) and self._needs_account_id_migration()
+            if needs_fresh:
+                self._conn.commit()
+                self._create_fresh_schema()
+                self._conn.commit()
+            elif needs_migrate:
+                # Recheck: another worker may have migrated while we waited for the lock.
+                if self._needs_account_id_migration():
+                    self._conn.commit()
+                    self._migrate_add_account_id()
+                    self._conn.commit()
+                else:
+                    self._conn.commit()
+            else:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_uid_to_gmail_hash "
+                    "ON uid_to_gmail(message_hash)"
+                )
+                self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
 
     def close(self) -> None:
         if self._conn:

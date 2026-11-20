@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 from fetcher.state import DEFAULT_ACCOUNT_ID, StateStore
@@ -18,6 +19,34 @@ def test_fresh_db_has_account_id(tmp_path: Path):
     store.record_import("hash1", "gid", "INBOX", 1, 10, account_id="isp1")
     assert store.seen_hash("hash1", account_id="isp1") is True
     assert store.seen_hash("hash1", account_id="isp2") is False
+    store.close()
+
+
+def test_concurrent_connect_creates_schema_once(tmp_path: Path):
+    """Two connections must not race on CREATE TABLE uid_state."""
+    db = tmp_path / "concurrent.db"
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            store = StateStore(db)
+            store.connect()
+            store.set_last_processed_uid("INBOX", 1, 1, account_id="a")
+            store.close()
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert not errors, errors
+    store = StateStore(db)
+    store.connect()
+    assert "account_id" in store._table_columns("uid_state")
     store.close()
 
 

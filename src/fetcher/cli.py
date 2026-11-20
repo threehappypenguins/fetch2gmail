@@ -150,7 +150,7 @@ def _cmd_config(args: argparse.Namespace) -> None:
         try:
             from .config import get_gmail_destinations_for_imap
 
-            cfg = load_config(config_path)
+            cfg = load_config(config_path, resolve_password=False)
             for acct in get_imap_accounts(cfg):
                 get_gmail_destinations_for_imap(cfg, acct)
             print("Config OK.")

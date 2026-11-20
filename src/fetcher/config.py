@@ -26,6 +26,36 @@ def password_env_key_for_account_id(account_id: str) -> str:
     return f"IMAP_PASSWORD_{cleaned.upper()}"
 
 
+def password_env_for_account_id(account_id: str) -> str:
+    """Env var name used to store this account's IMAP password."""
+    acct_id = (account_id or "").strip()
+    if acct_id == DEFAULT_IMAP_ACCOUNT_ID:
+        return "IMAP_PASSWORD"
+    return password_env_key_for_account_id(acct_id)
+
+
+def validate_unique_password_env_keys(account_ids: list[str]) -> None:
+    """
+    Raise ValueError if distinct account ids derive the same credential key.
+
+    IDs that differ only by punctuation or letter case (e.g. my-isp / my_isp / MY_ISP)
+    all map to IMAP_PASSWORD_MY_ISP and must not be saved together.
+    """
+    seen: dict[str, str] = {}
+    for raw in account_ids:
+        acct_id = (raw or "").strip()
+        if not acct_id:
+            continue
+        key = password_env_for_account_id(acct_id)
+        prev = seen.get(key)
+        if prev is not None and prev != acct_id:
+            raise ValueError(
+                f"IMAP account ids {prev!r} and {acct_id!r} both map to credential key {key}; "
+                "choose ids that differ by more than punctuation or letter case"
+            )
+        seen[key] = acct_id
+
+
 def _resolve_imap_password(imap: dict[str, Any], config_dir: Path) -> dict[str, Any]:
     """Return imap dict with password filled from env / encrypted .env when needed."""
     if imap.get("password") not in (None, ""):
@@ -33,21 +63,60 @@ def _resolve_imap_password(imap: dict[str, Any], config_dir: Path) -> dict[str, 
     key = imap.get("password_env")
     if not key:
         return imap
+    acct_id = str(imap.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
     enc_val = os.environ.get(f"{key}_ENC")
     if enc_val:
         from .env_file import decrypt_env_value
 
-        return {**imap, "password": decrypt_env_value(config_dir, enc_val)}
+        try:
+            return {**imap, "password": decrypt_env_value(config_dir, enc_val)}
+        except Exception as e:
+            raise ValueError(
+                f"IMAP password for account {acct_id!r} could not be decrypted ({key}_ENC): {e}"
+            ) from e
     plain_val = os.environ.get(key)
     if not plain_val:
         raise ValueError(
-            f"Environment variable {key} or {key}_ENC is not set (required for IMAP password)"
+            f"IMAP password for account {acct_id!r} is not set "
+            f"(environment variable {key} or {key}_ENC required)"
         )
     return {**imap, "password": plain_val}
 
 
-def load_config(path: str | Path, resolve_password: bool = True) -> dict[str, Any]:
-    """Load config from JSON file. If resolve_password is True, resolve IMAP passwords from env."""
+def _store_resolved_imap_account(cfg: dict[str, Any], resolved: dict[str, Any]) -> None:
+    """Write one password-resolved IMAP account back into cfg."""
+    acct_id = str(resolved.get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+    if isinstance(cfg.get("imap_accounts"), list) and len(cfg["imap_accounts"]) > 0:
+        cfg["imap_accounts"] = [
+            resolved if str(a.get("id")) == acct_id else a for a in cfg["imap_accounts"]
+        ]
+        # Keep legacy `imap` in sync when it is the first / matching account.
+        first_id = str(cfg["imap_accounts"][0].get("id") or DEFAULT_IMAP_ACCOUNT_ID)
+        if "imap" in cfg and acct_id == first_id:
+            cfg["imap"] = {
+                k: v for k, v in resolved.items() if k not in ("id", "gmail_token_paths")
+            }
+        return
+    # Legacy single-imap config
+    cfg["imap"] = {
+        k: v for k, v in resolved.items() if k not in ("id", "gmail_token_paths")
+    }
+
+
+def load_config(
+    path: str | Path,
+    resolve_password: bool = True,
+    *,
+    account_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Load config from JSON file.
+
+    If resolve_password is True, resolve credentials only for the selected IMAP
+    account (account_id), or the first/sole account when account_id is None.
+    Other accounts are left unresolved so a missing/undecryptable password on one
+    account cannot block watchers or fetches for healthy accounts.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -58,22 +127,12 @@ def load_config(path: str | Path, resolve_password: bool = True) -> dict[str, An
     if not resolve_password:
         return cfg
 
-    # Resolve passwords for all normalized IMAP accounts and write back into cfg shape.
-    accounts = get_imap_accounts(cfg)
-    resolved: list[dict[str, Any]] = []
-    for acct in accounts:
-        resolved.append(_resolve_imap_password(dict(acct), config_dir))
-
-    if isinstance(cfg.get("imap_accounts"), list) and len(cfg["imap_accounts"]) > 0:
-        cfg["imap_accounts"] = resolved
-        # Keep legacy `imap` in sync with the first account when present.
-        if "imap" in cfg and resolved:
-            legacy = {k: v for k, v in resolved[0].items() if k not in ("id", "gmail_token_paths")}
-            cfg["imap"] = legacy
-    elif resolved:
-        # Legacy single-imap config
-        legacy = {k: v for k, v in resolved[0].items() if k not in ("id", "gmail_token_paths")}
-        cfg["imap"] = legacy
+    try:
+        target = get_imap_account(cfg, account_id)
+    except ValueError:
+        return cfg
+    resolved = _resolve_imap_password(dict(target), config_dir)
+    _store_resolved_imap_account(cfg, resolved)
     return cfg
 
 
@@ -195,3 +254,40 @@ def get_gmail_destinations_for_imap(
         # Explicit empty after filtering blanks → treat as all (same as omit).
         return list(all_gmail)
     return selected
+
+
+def prune_stale_gmail_routes(
+    imap_accounts: list[dict[str, Any]],
+    valid_token_names: set[str],
+) -> None:
+    """
+    Remove gmail_token_paths entries that are no longer in gmail_accounts.
+
+    Mutates imap_accounts in place. An omitted or already-empty route (meaning
+    "all destinations") is left alone. If an *explicit* non-empty route would
+    become empty after pruning, raise ValueError — empty means "all remaining
+    Gmail accounts", which would silently broaden the user's selection.
+    """
+    updates: list[tuple[dict[str, Any], list[Any]]] = []
+    for acct in imap_accounts:
+        paths = acct.get("gmail_token_paths")
+        if not isinstance(paths, list) or len(paths) == 0:
+            continue
+        pruned = [
+            p
+            for p in paths
+            if str(p).strip()
+            and (
+                _normalize_token_path(p) in valid_token_names
+                or str(p).strip() in valid_token_names
+            )
+        ]
+        if not pruned:
+            raise ValueError(
+                f"IMAP account {acct.get('id')!r} is explicitly routed only to "
+                f"Gmail destination(s) being removed. Update that account's "
+                f"Gmail destinations before removing them."
+            )
+        updates.append((acct, pruned))
+    for acct, pruned in updates:
+        acct["gmail_token_paths"] = pruned
