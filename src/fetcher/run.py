@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 # Gmail API user id
 USER_ID = "me"
 
-# (service, label_id, inbox_label_id, unread_label_id, destination_key)
-GmailContext = tuple[Any, str | None, str, str, str]
+# (service, label_id, inbox_label_id, unread_label_id, destination_keys)
+# destination_keys lists aliases for one mailbox (e.g. gmail:email + oauth:fingerprint).
+GmailContext = tuple[Any, str | None, str, str, list[str]]
 
 
 def _ensure_label(service: Any, label_name: str) -> str:
@@ -74,25 +75,41 @@ def _oauth_token_fingerprint(token_path: Path) -> str | None:
     return f"oauth:{digest}"
 
 
-def gmail_destination_identity(service: Any, token_path: Path) -> str:
+def gmail_destination_identities(service: Any, token_path: Path) -> list[str]:
     """
-    Stable Gmail-account identity for delivery history.
+    All delivery-history identities for one Gmail mailbox.
 
-    Prefer the mailbox email so a reused token filename (e.g. token2.json) for a
-    different Google account does not inherit the previous account's skip records.
-    Fall back to an OAuth-token fingerprint, then the token path as last resort.
+    Always includes the OAuth-token fingerprint when available, and the mailbox
+    email when getProfile succeeds. Check/record against every alias so a
+    transient profile failure (gmail:... ↔ oauth:...) cannot miss a prior
+    successful delivery and re-import mail without a Message-ID.
     """
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def _add(key: str | None) -> None:
+        if not key or key in seen:
+            return
+        seen.add(key)
+        keys.append(key)
+
     try:
         profile = service.users().getProfile(userId=USER_ID).execute()
         email = str(profile.get("emailAddress") or "").strip().lower()
         if email:
-            return f"gmail:{email}"
+            _add(f"gmail:{email}")
     except Exception:  # noqa: BLE001
         logger.debug("Could not resolve Gmail email for %s", token_path, exc_info=True)
-    fingerprint = _oauth_token_fingerprint(token_path)
-    if fingerprint:
-        return fingerprint
-    return f"path:{_token_path_identity(token_path) or token_path.name}"
+
+    _add(_oauth_token_fingerprint(token_path))
+    if not keys:
+        _add(f"path:{_token_path_identity(token_path) or token_path.name}")
+    return keys
+
+
+def gmail_destination_identity(service: Any, token_path: Path) -> str:
+    """Preferred (first) identity for logging / invalidation helpers."""
+    return gmail_destination_identities(service, token_path)[0]
 
 
 def destination_keys_for_token_invalidation(
@@ -120,7 +137,7 @@ def destination_keys_for_token_invalidation(
             cred = config_dir / cred
         if tp.exists() and cred.exists():
             service = get_gmail_service(cred, tp)
-            keys.add(gmail_destination_identity(service, tp))
+            keys.update(gmail_destination_identities(service, tp))
     except Exception:  # noqa: BLE001
         logger.debug("Could not resolve Gmail identity to invalidate for %s", tp, exc_info=True)
     return {k for k in keys if k}
@@ -131,9 +148,9 @@ def _build_gmail_contexts(
     config_dir: Path,
 ) -> list[GmailContext]:
     """
-    Build list of (service, label_id, inbox_label_id, unread_label_id, destination_key).
+    Build list of (service, label_id, inbox_label_id, unread_label_id, destination_keys).
     Paths in account dicts are resolved relative to config_dir.
-    destination_key is a stable Gmail-account identity (not a reusable filename).
+    destination_keys are stable Gmail-account identities (email + oauth aliases).
     """
     contexts: list[GmailContext] = []
     for acct in gmail_accounts:
@@ -147,11 +164,11 @@ def _build_gmail_contexts(
         use_label = acct.get("use_label") if "use_label" in acct else bool((acct.get("label") or "").strip())
         label_name = (acct.get("label") or "ISP Mail").strip() if use_label else None
         service = get_gmail_service(cred_path, token_path)
-        destination_key = gmail_destination_identity(service, token_path)
+        destination_keys = gmail_destination_identities(service, token_path)
         inbox_label_id = get_inbox_label_id(service, USER_ID)
         unread_label_id = get_unread_label_id(service, USER_ID)
         label_id = _ensure_label(service, label_name) if label_name else None
-        contexts.append((service, label_id, inbox_label_id, unread_label_id, destination_key))
+        contexts.append((service, label_id, inbox_label_id, unread_label_id, destination_keys))
     return contexts
 
 
@@ -197,9 +214,10 @@ def _deliver_to_gmail_destinations(
     Ensure every current Gmail destination has this message.
 
     A destination is skipped when Gmail already has the RFC822 Message-ID, or when
-    state records a prior successful delivery of this source hash to that
-    destination_key. Aggregate hash history alone never skips a destination that
-    has not yet received the message (so new routes still get mail).
+    state records a prior successful delivery of this source hash under any of
+    that destination's identity aliases (gmail:email and/or oauth:fingerprint).
+    Aggregate hash history alone never skips a destination that has not yet
+    received the message (so new routes still get mail).
     """
     prefix = f"{log_prefix} " if log_prefix else ""
     message_id_header = _parse_message_id_from_raw(raw)
@@ -209,10 +227,12 @@ def _deliver_to_gmail_destinations(
     all_already_had = True
     skip_entire_message = False
 
-    for idx, (service, label_id, inbox_label_id, unread_label_id, destination_key) in enumerate(
+    for idx, (service, label_id, inbox_label_id, unread_label_id, destination_keys) in enumerate(
         gmail_contexts
     ):
         try:
+            dest_keys = list(destination_keys) if destination_keys else []
+            dest_label = dest_keys[0] if dest_keys else f"account-{idx + 1}"
             already_here = False
             if message_id_header:
                 already_here = gmail_has_message_with_id(
@@ -222,8 +242,8 @@ def _deliver_to_gmail_destinations(
                 not already_here
                 and state is not None
                 and message_hash
-                and state.has_delivered_hash_to(
-                    message_hash, destination_key, account_id=account_id
+                and state.has_delivered_hash_to_any(
+                    message_hash, dest_keys, account_id=account_id
                 )
             ):
                 already_here = True
@@ -231,14 +251,15 @@ def _deliver_to_gmail_destinations(
                     "%suid=%s already delivered to %s (hash+dest) [%s]",
                     prefix,
                     uid,
-                    destination_key,
+                    dest_label,
                     account_id,
                 )
             if already_here:
                 if state is not None and message_hash:
-                    state.record_hash_delivery(
+                    # Backfill every current alias so profile recovery stays linked.
+                    state.record_hash_delivery_aliases(
                         message_hash,
-                        destination_key,
+                        dest_keys,
                         "already-present",
                         account_id=account_id,
                     )
@@ -267,9 +288,9 @@ def _deliver_to_gmail_destinations(
             if first_gmail_id is None:
                 first_gmail_id = gmail_id
             if state is not None and message_hash:
-                state.record_hash_delivery(
+                state.record_hash_delivery_aliases(
                     message_hash,
-                    destination_key,
+                    dest_keys,
                     gmail_id,
                     account_id=account_id,
                 )

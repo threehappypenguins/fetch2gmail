@@ -8,13 +8,15 @@ from unittest.mock import MagicMock, patch
 
 from fetcher.run import (
     _deliver_to_gmail_destinations,
+    gmail_destination_identities,
     gmail_destination_identity,
 )
 from fetcher.state import StateStore
 
 
-def _ctx(dest: str = "gmail:a@example.com"):
-    return (MagicMock(name="service"), "LBL", "INBOX", "UNREAD", dest)
+def _ctx(*dest_keys: str):
+    keys = list(dest_keys) if dest_keys else ["gmail:a@example.com"]
+    return (MagicMock(name="service"), "LBL", "INBOX", "UNREAD", keys)
 
 
 RAW = b"From: a@example.com\r\nMessage-ID: <m1@example.com>\r\n\r\nbody"
@@ -185,15 +187,17 @@ def test_partial_success_records_dest_so_retry_skips_it(mock_has, mock_import, t
     store.close()
 
 
-def test_gmail_destination_identity_uses_email_not_filename():
+def test_gmail_destination_identity_uses_email_not_filename(tmp_path):
+    token = tmp_path / "token2.json"
+    token.write_text(json.dumps({"refresh_token": "rt-same"}), encoding="utf-8")
     service = MagicMock()
     service.users().getProfile().execute.return_value = {
         "emailAddress": "New.User@Example.com"
     }
-    assert (
-        gmail_destination_identity(service, Path("token2.json"))
-        == "gmail:new.user@example.com"
-    )
+    assert gmail_destination_identity(service, token) == "gmail:new.user@example.com"
+    aliases = gmail_destination_identities(service, token)
+    assert aliases[0] == "gmail:new.user@example.com"
+    assert any(a.startswith("oauth:") for a in aliases)
 
 
 def test_reused_token_filename_does_not_inherit_prior_account_history(tmp_path):
@@ -251,3 +255,71 @@ def test_oauth_fingerprint_fallback_when_profile_unavailable(tmp_path):
     key2 = gmail_destination_identity(service, token)
     assert key2.startswith("oauth:")
     assert key2 != key
+
+
+def test_profile_failure_alias_does_not_reimport_after_success(tmp_path):
+    """
+    Success under gmail:+oauth: must still skip when a later run only has oauth:
+    (transient getProfile failure), and vice versa after recovery.
+    """
+    store = StateStore(tmp_path / "state.db")
+    store.connect()
+    email_key = "gmail:user@example.com"
+    oauth_key = "oauth:deadbeefcafebabe0123456789abcdef"
+
+    with (
+        patch("fetcher.run.import_message", return_value="gid-1") as mock_import,
+        patch("fetcher.run.gmail_has_message_with_id", return_value=False),
+    ):
+        first = _deliver_to_gmail_destinations(
+            gmail_contexts=[_ctx(email_key, oauth_key)],
+            raw=RAW_NO_MID,
+            uid=10,
+            account_id="isp1",
+            message_hash=HASH,
+            never_mark_spam=True,
+            mark_unread=True,
+            state=store,
+        )
+    assert first.any_imported is True
+    assert mock_import.call_count == 1
+    assert store.has_delivered_hash_to(HASH, email_key, account_id="isp1")
+    assert store.has_delivered_hash_to(HASH, oauth_key, account_id="isp1")
+
+    # Profile down: only oauth alias available — must not re-import.
+    with (
+        patch("fetcher.run.import_message", return_value="gid-2") as mock_import,
+        patch("fetcher.run.gmail_has_message_with_id", return_value=False),
+    ):
+        second = _deliver_to_gmail_destinations(
+            gmail_contexts=[_ctx(oauth_key)],
+            raw=RAW_NO_MID,
+            uid=10,
+            account_id="isp1",
+            message_hash=HASH,
+            never_mark_spam=True,
+            mark_unread=True,
+            state=store,
+        )
+    assert second.all_already_had is True
+    assert second.any_imported is False
+    mock_import.assert_not_called()
+
+    # Profile recovers with both aliases again — still skip.
+    with (
+        patch("fetcher.run.import_message", return_value="gid-3") as mock_import,
+        patch("fetcher.run.gmail_has_message_with_id", return_value=False),
+    ):
+        third = _deliver_to_gmail_destinations(
+            gmail_contexts=[_ctx(email_key, oauth_key)],
+            raw=RAW_NO_MID,
+            uid=10,
+            account_id="isp1",
+            message_hash=HASH,
+            never_mark_spam=True,
+            mark_unread=True,
+            state=store,
+        )
+    assert third.all_already_had is True
+    mock_import.assert_not_called()
+    store.close()

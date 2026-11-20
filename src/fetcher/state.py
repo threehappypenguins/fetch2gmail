@@ -335,14 +335,30 @@ class StateStore:
         account_id: str = DEFAULT_ACCOUNT_ID,
     ) -> bool:
         """True if this source hash was successfully delivered to this Gmail destination."""
+        return self.has_delivered_hash_to_any(
+            message_hash, [destination_key], account_id=account_id
+        )
+
+    def has_delivered_hash_to_any(
+        self,
+        message_hash: str,
+        destination_keys: list[str] | set[str],
+        account_id: str = DEFAULT_ACCOUNT_ID,
+    ) -> bool:
+        """True if any alias identity already has a delivery record for this hash."""
+        keys = [str(k).strip() for k in destination_keys if str(k).strip()]
+        if not keys:
+            return False
         self.connect()
         assert self._conn is not None
+        placeholders = ",".join("?" * len(keys))
         row = self._conn.execute(
-            """
+            f"""
             SELECT 1 FROM hash_deliveries
-            WHERE account_id = ? AND message_hash = ? AND destination_key = ?
+            WHERE account_id = ? AND message_hash = ? AND destination_key IN ({placeholders})
+            LIMIT 1
             """,
-            (account_id, message_hash, destination_key),
+            (account_id, message_hash, *keys),
         ).fetchone()
         return row is not None
 
@@ -354,18 +370,34 @@ class StateStore:
         account_id: str = DEFAULT_ACCOUNT_ID,
     ) -> None:
         """Persist successful (or already-present) delivery of a hash to one destination."""
+        self.record_hash_delivery_aliases(
+            message_hash, [destination_key], gmail_message_id, account_id=account_id
+        )
+
+    def record_hash_delivery_aliases(
+        self,
+        message_hash: str,
+        destination_keys: list[str] | set[str],
+        gmail_message_id: str,
+        account_id: str = DEFAULT_ACCOUNT_ID,
+    ) -> None:
+        """Persist delivery under every identity alias for one Gmail mailbox."""
+        keys = [str(k).strip() for k in destination_keys if str(k).strip()]
+        if not keys:
+            return
         self.connect()
         assert self._conn is not None
-        self._conn.execute(
-            """
-            INSERT INTO hash_deliveries
-                (account_id, message_hash, destination_key, gmail_message_id, created_at)
-            VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
-            ON CONFLICT (account_id, message_hash, destination_key) DO UPDATE SET
-                gmail_message_id = excluded.gmail_message_id
-            """,
-            (account_id, message_hash, destination_key, gmail_message_id),
-        )
+        for destination_key in keys:
+            self._conn.execute(
+                """
+                INSERT INTO hash_deliveries
+                    (account_id, message_hash, destination_key, gmail_message_id, created_at)
+                VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
+                ON CONFLICT (account_id, message_hash, destination_key) DO UPDATE SET
+                    gmail_message_id = excluded.gmail_message_id
+                """,
+                (account_id, message_hash, destination_key, gmail_message_id),
+            )
         self._conn.commit()
 
     def clear_hash_deliveries_for_destinations(self, destination_keys: list[str] | set[str]) -> int:
